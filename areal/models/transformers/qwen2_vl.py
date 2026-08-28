@@ -17,6 +17,16 @@ from areal.models.fsdp.ulysses import (
 )
 
 
+def _get_mrope_section(attention: object):
+    """Read mRoPE config across old and new Transformers attention APIs."""
+    rope_parameters = getattr(attention, "rope_parameters", None)
+    if rope_parameters is None:
+        rope_parameters = getattr(attention, "rope_scaling", None)
+    if rope_parameters is None or "mrope_section" not in rope_parameters:
+        raise ValueError("Qwen-VL attention is missing mrope_section configuration")
+    return rope_parameters["mrope_section"]
+
+
 def ulysses_flash_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -60,7 +70,7 @@ def ulysses_flash_attn_forward(
         cos, sin = position_embeddings
 
     query_states, key_states = apply_multimodal_rotary_pos_emb(
-        query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+        query_states, key_states, cos, sin, _get_mrope_section(self)
     )
 
     # NOTE: This is the unpatched vanilla implementation in transformers

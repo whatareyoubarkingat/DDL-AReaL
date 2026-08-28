@@ -51,6 +51,45 @@ class SGLangBackend:
         _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
         return _env
 
+    @staticmethod
+    def _prepare_input_ids(req: ModelRequest) -> list[int]:
+        """Prepare token IDs for SGLang's multimodal preprocessing.
+
+        Hugging Face VLM processors expand one image placeholder into a run of
+        patch tokens. SGLang runs the processor again for ``image_data``, so it
+        must receive one placeholder per image rather than the expanded run.
+        Keep ``req.input_ids`` unchanged because those expanded IDs are the
+        sequence used by the training workers.
+        """
+        input_ids = req.input_ids.copy()
+        if not req.image_data or req.processor is None:
+            return input_ids
+        if type(req.processor).__name__ != "Qwen2_5_VLProcessor":
+            return input_ids
+
+        image_token_id = getattr(req.processor, "image_token_id", None)
+        if image_token_id is None:
+            image_token = getattr(req.processor, "image_token", None)
+            if image_token is not None and req.tokenizer is not None:
+                image_token_id = req.tokenizer.convert_tokens_to_ids(image_token)
+        if not isinstance(image_token_id, int):
+            return input_ids
+
+        collapsed: list[int] = []
+        for token_id in input_ids:
+            if (
+                token_id == image_token_id
+                and collapsed
+                and collapsed[-1] == image_token_id
+            ):
+                continue
+            collapsed.append(token_id)
+        if collapsed.count(image_token_id) != len(req.image_data):
+            raise ValueError(
+                "Qwen2.5-VL image placeholders do not match image_data"
+            )
+        return collapsed
+
     def build_generation_request(
         self, req: ModelRequest, with_lora: bool, version: int
     ) -> HttpRequest:
@@ -78,7 +117,7 @@ class SGLangBackend:
             sample_params["stop"] = stop
 
         payload = {
-            "input_ids": req.input_ids.copy(),
+            "input_ids": self._prepare_input_ids(req),
             "image_data": req.image_data,  # ImageObject or str
             "sampling_params": sample_params,
             "return_logprob": True,

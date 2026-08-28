@@ -217,6 +217,13 @@ def _prepare_multimodal_forward_inputs(
     _drop_multimodal_payloads(mb)
 
 
+def _fallback_qwen_vl_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Build ordinary text positions in Qwen-VL's three-axis layout."""
+    position_ids = attention_mask.long().cumsum(-1) - 1
+    position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+    return position_ids.unsqueeze(0).expand(3, -1, -1)
+
+
 class FSDPEngine(TrainEngine):
     def __init__(self, config: TrainEngineConfig):
         self.config = config
@@ -1033,6 +1040,46 @@ class FSDPEngine(TrainEngine):
             )
         return model
 
+    def _create_vision_actor_or_critic(self, dtype: torch.dtype):
+        common_kwargs = {
+            "pretrained_model_name_or_path": self.config.path,
+            "trust_remote_code": True,
+            "dtype": dtype,
+            "attn_implementation": self.config.attn_impl,
+        }
+
+        if not self.config.is_critic:
+            return AutoModelForImageTextToText.from_pretrained(**common_kwargs)
+
+        if self.model_config.model_type != "qwen2_5_vl":
+            raise NotImplementedError(
+                "FSDP vision critics currently support only qwen2_5_vl, got "
+                f"{self.model_config.model_type!r}."
+            )
+        if self.config.use_lora:
+            raise NotImplementedError(
+                "LoRA is not yet supported for FSDP Qwen2.5-VL critics because "
+                "the current PEFT saver does not persist the scalar score head."
+            )
+
+        from areal.models.transformers.qwen2_5_vl_value import (
+            AReaLQwen2_5_VLForTokenClassification,
+        )
+
+        # Saver writes self.model_config after model.save_pretrained(), so put
+        # the same critic metadata on the engine config passed to the model.
+        # Transformers may copy the config internally, but both serialized
+        # configs must describe the scalar-head architecture.
+        self.model_config.num_labels = 1
+        self.model_config.architectures = [
+            "AReaLQwen2_5_VLForTokenClassification"
+        ]
+        self.model_config.areal_model_role = "critic"
+        return AReaLQwen2_5_VLForTokenClassification.from_pretrained(
+            config=self.model_config,
+            **common_kwargs,
+        )
+
     def _create_device_model(self):
         current_platform.set_device(int(os.environ["LOCAL_RANK"]))
         current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
@@ -1082,12 +1129,7 @@ class FSDPEngine(TrainEngine):
             tik = time.perf_counter()
             # VLM: Use from_pretrained() on loading_device.
             with torch.device(loading_device):
-                model = AutoModelForImageTextToText.from_pretrained(
-                    pretrained_model_name_or_path=self.config.path,
-                    trust_remote_code=True,
-                    dtype=dtype,
-                    attn_implementation=self.config.attn_impl,
-                )
+                model = self._create_vision_actor_or_critic(dtype)
                 if self.config.disable_dropout:
                     disable_dropout_in_model(model)
         else:
@@ -1938,6 +1980,8 @@ class FSDPEngine(TrainEngine):
                 inputs_embeds=None,
                 past_key_values=None,
             )
+            if position_ids is None:
+                position_ids = _fallback_qwen_vl_position_ids(attn_mask)
             position_ids = torch.einsum("ijk->jki", position_ids)
             input_["position_ids"] = position_ids
         else:
