@@ -14,7 +14,12 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 
 
 class AReaLQwen2_5_VLForTokenClassification(Qwen2_5_VLPreTrainedModel):
-    """Qwen2.5-VL backbone with one scalar value for every input token."""
+    """Qwen2.5-VL backbone with one scalar value for every input token.
+
+    PPO training scores complete sequences with ``use_cache=False``. The
+    structured ``TokenClassifierOutput`` intentionally does not expose
+    ``past_key_values`` and is not an incremental-generation interface.
+    """
 
     _checkpoint_conversion_mapping = {
         "^visual": "model.visual",
@@ -79,6 +84,9 @@ class AReaLQwen2_5_VLForTokenClassification(Qwen2_5_VLPreTrainedModel):
         logits = self.score(outputs.last_hidden_state)
         if return_dict is False:
             return (logits, *outputs.to_tuple()[1:])
+        # TokenClassifierOutput has no cache field. FSDP PPO always sets
+        # use_cache=False; callers that need incremental decoding must use the
+        # causal actor rather than this scalar critic.
         return TokenClassifierOutput(
             logits=logits,
             hidden_states=outputs.hidden_states,

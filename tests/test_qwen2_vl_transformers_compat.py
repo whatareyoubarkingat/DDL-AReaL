@@ -17,6 +17,8 @@ def test_text_only_qwen_vl_position_ids_use_three_identical_axes():
     expected = torch.tensor([[0, 1, 0, 0], [0, 1, 2, 0]])
     assert position_ids.shape == (3, 2, 4)
     assert position_ids.dtype == torch.long
+    assert position_ids.is_contiguous()
+    assert 0 not in position_ids.stride()
     torch.testing.assert_close(position_ids[0], expected)
     torch.testing.assert_close(position_ids[1], expected)
     torch.testing.assert_close(position_ids[2], expected)

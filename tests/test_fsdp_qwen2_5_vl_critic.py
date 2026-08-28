@@ -10,7 +10,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
 )
 
-from areal.engine.fsdp_engine import FSDPEngine
+from areal.engine.fsdp_engine import FSDPEngine, _validate_fsdp_critic_lora
 from areal.models.transformers.qwen2_5_vl_value import (
     AReaLQwen2_5_VLForTokenClassification,
 )
@@ -107,7 +107,7 @@ def test_qwen25_vl_critic_returns_one_value_per_token_and_backprops():
         stats_tracker.export_all(reset=True)
 
 
-def test_qwen25_vl_critic_forwards_multimodal_arguments():
+def test_qwen25_vl_critic_forwards_inputs_but_structured_output_omits_cache():
     model = AReaLQwen2_5_VLForTokenClassification(_tiny_config())
     calls = []
 
@@ -124,20 +124,26 @@ def test_qwen25_vl_critic_forwards_multimodal_arguments():
     pixel_values = torch.randn(2, 12)
     image_grid_thw = torch.tensor([[1, 1, 2]])
     mm_token_type_ids = torch.ones(1, 4, dtype=torch.int)
+    past_key_values = object()
     output = model(
         **_text_inputs(),
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
         mm_token_type_ids=mm_token_type_ids,
+        past_key_values=past_key_values,
+        use_cache=True,
     )
 
     assert output.logits.shape == (1, 4, 1)
     assert calls[0]["pixel_values"] is pixel_values
     assert calls[0]["image_grid_thw"] is image_grid_thw
     assert calls[0]["mm_token_type_ids"] is mm_token_type_ids
+    assert calls[0]["past_key_values"] is past_key_values
+    assert calls[0]["use_cache"] is True
+    assert not hasattr(output, "past_key_values")
 
 
-def test_qwen25_vl_critic_warmstarts_and_reloads_scalar_head(tmp_path):
+def test_qwen25_vl_critic_warmstarts_and_reloads_through_areal_engine(tmp_path):
     actor_path = tmp_path / "actor"
     critic_path = tmp_path / "critic"
     actor = Qwen2_5_VLForConditionalGeneration(_tiny_config())
@@ -149,7 +155,6 @@ def test_qwen25_vl_critic_warmstarts_and_reloads_scalar_head(tmp_path):
 
     assert isinstance(critic, AReaLQwen2_5_VLForTokenClassification)
     assert critic.config.architectures == engine.model_config.architectures
-    assert critic.config.areal_model_role == engine.model_config.areal_model_role
     assert critic.score.weight.shape == (1, 32)
     assert "lm_head.weight" not in critic.state_dict()
     assert torch.equal(
@@ -170,7 +175,6 @@ def test_qwen25_vl_critic_warmstarts_and_reloads_scalar_head(tmp_path):
     assert reloaded.score.weight.shape == (1, 32)
     assert torch.equal(reloaded.score.weight, critic.score.weight)
     assert reload_config.architectures == ["AReaLQwen2_5_VLForTokenClassification"]
-    assert reload_config.areal_model_role == "critic"
 
 
 def test_qwen25_vl_actor_still_uses_image_text_auto_factory(monkeypatch):
@@ -193,16 +197,25 @@ def test_qwen25_vl_actor_still_uses_image_text_auto_factory(monkeypatch):
     assert calls[0]["attn_implementation"] == "eager"
 
 
-@pytest.mark.parametrize(
-    ("model_type", "use_lora", "message"),
-    [
-        ("other_vlm", False, "support only qwen2_5_vl"),
-        ("qwen2_5_vl", True, "LoRA is not yet supported"),
-    ],
-)
-def test_unsupported_vision_critic_modes_fail_early(model_type, use_lora, message):
+def test_unsupported_vision_critic_model_fails_early():
     config = _tiny_config()
-    config.model_type = model_type
-    engine = _bare_engine("critic", config, use_lora=use_lora)
-    with pytest.raises(NotImplementedError, match=message):
+    config.model_type = "other_vlm"
+    engine = _bare_engine("critic", config)
+    with pytest.raises(NotImplementedError, match="support only qwen2_5_vl"):
         engine._create_vision_actor_or_critic(torch.float32)
+
+
+@pytest.mark.parametrize("model_type", ["qwen2", "qwen2_5_vl"])
+def test_all_fsdp_critics_with_lora_fail_before_model_loading(model_type):
+    config = SimpleNamespace(is_critic=True, use_lora=True, model_type=model_type)
+
+    with pytest.raises(
+        NotImplementedError, match="LoRA is not supported for FSDP critics"
+    ):
+        _validate_fsdp_critic_lora(config)
+
+
+def test_fsdp_actor_with_lora_remains_supported():
+    config = SimpleNamespace(is_critic=False, use_lora=True)
+
+    _validate_fsdp_critic_lora(config)

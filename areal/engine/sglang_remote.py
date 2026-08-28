@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import uuid
+import warnings
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from typing import Any
@@ -62,16 +63,23 @@ class SGLangBackend:
         sequence used by the training workers.
         """
         input_ids = req.input_ids.copy()
-        if not req.image_data or req.processor is None:
+        if not req.image_data:
             return input_ids
-        if type(req.processor).__name__ != "Qwen2_5_VLProcessor":
+        if req.processor is None:
+            warnings.warn(
+                "SGLang received image_data without a processor; expanded image "
+                "placeholders cannot be normalized",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return input_ids
 
         image_token_id = getattr(req.processor, "image_token_id", None)
         if image_token_id is None:
             image_token = getattr(req.processor, "image_token", None)
-            if image_token is not None and req.tokenizer is not None:
-                image_token_id = req.tokenizer.convert_tokens_to_ids(image_token)
+            tokenizer = req.tokenizer or getattr(req.processor, "tokenizer", None)
+            if image_token is not None and tokenizer is not None:
+                image_token_id = tokenizer.convert_tokens_to_ids(image_token)
         if not isinstance(image_token_id, int):
             return input_ids
 
@@ -85,7 +93,10 @@ class SGLangBackend:
                 continue
             collapsed.append(token_id)
         if collapsed.count(image_token_id) != len(req.image_data):
-            raise ValueError("Qwen2.5-VL image placeholders do not match image_data")
+            raise ValueError(
+                "image placeholders do not match image_data: "
+                f"{collapsed.count(image_token_id)} != {len(req.image_data)}"
+            )
         return collapsed
 
     def build_generation_request(

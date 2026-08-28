@@ -221,7 +221,17 @@ def _fallback_qwen_vl_position_ids(attention_mask: torch.Tensor) -> torch.Tensor
     """Build ordinary text positions in Qwen-VL's three-axis layout."""
     position_ids = attention_mask.long().cumsum(-1) - 1
     position_ids = position_ids.masked_fill(attention_mask == 0, 0)
-    return position_ids.unsqueeze(0).expand(3, -1, -1)
+    return position_ids.unsqueeze(0).expand(3, -1, -1).contiguous()
+
+
+def _validate_fsdp_critic_lora(config: TrainEngineConfig) -> None:
+    """Reject critic LoRA before FSDP creates or loads a model."""
+    if config.is_critic and config.use_lora:
+        raise NotImplementedError(
+            "LoRA is not supported for FSDP critics because the PEFT wrapper "
+            "uses a causal-LM task and the adapter-only saver does not persist "
+            "the scalar score head. Set use_lora=false."
+        )
 
 
 class FSDPEngine(TrainEngine):
@@ -388,6 +398,8 @@ class FSDPEngine(TrainEngine):
 
         if is_tms_enabled():
             torch_memory_saver.hook_mode = "preload"
+
+        _validate_fsdp_critic_lora(self.config)
 
         # Create device model
         self._create_device_model()
@@ -1056,23 +1068,15 @@ class FSDPEngine(TrainEngine):
                 "FSDP vision critics currently support only qwen2_5_vl, got "
                 f"{self.model_config.model_type!r}."
             )
-        if self.config.use_lora:
-            raise NotImplementedError(
-                "LoRA is not yet supported for FSDP Qwen2.5-VL critics because "
-                "the current PEFT saver does not persist the scalar score head."
-            )
-
         from areal.models.transformers.qwen2_5_vl_value import (
             AReaLQwen2_5_VLForTokenClassification,
         )
 
-        # Saver writes self.model_config after model.save_pretrained(), so put
-        # the same critic metadata on the engine config passed to the model.
-        # Transformers may copy the config internally, but both serialized
-        # configs must describe the scalar-head architecture.
+        # Saver writes self.model_config after model.save_pretrained().
+        # Transformers may copy the config internally, so both configs must
+        # describe the scalar-head architecture.
         self.model_config.num_labels = 1
         self.model_config.architectures = ["AReaLQwen2_5_VLForTokenClassification"]
-        self.model_config.areal_model_role = "critic"
         return AReaLQwen2_5_VLForTokenClassification.from_pretrained(
             config=self.model_config,
             **common_kwargs,
