@@ -15,9 +15,7 @@ def test_vlm_request_collapses_expanded_image_token_runs():
         processor=Qwen2_5_VLProcessor(),
     )
 
-    request = SGLangBackend().build_generation_request(
-        req, with_lora=False, version=0
-    )
+    request = SGLangBackend().build_generation_request(req, with_lora=False, version=0)
 
     assert request.payload["input_ids"] == [
         1,
@@ -32,9 +30,7 @@ def test_vlm_request_collapses_expanded_image_token_runs():
 def test_text_request_keeps_input_ids_unchanged():
     req = ModelRequest(input_ids=[1, 2, 2, 3], image_data=None)
 
-    request = SGLangBackend().build_generation_request(
-        req, with_lora=False, version=0
-    )
+    request = SGLangBackend().build_generation_request(req, with_lora=False, version=0)
 
     assert request.payload["input_ids"] == req.input_ids
 
@@ -42,8 +38,6 @@ def test_text_request_keeps_input_ids_unchanged():
 def test_vlm_request_without_processor_keeps_input_ids_unchanged():
     req = ModelRequest(input_ids=[1, 2, 2, 3], image_data=["image"])
 
-    request = SGLangBackend().build_generation_request(
-        req, with_lora=False, version=0
-    )
+    request = SGLangBackend().build_generation_request(req, with_lora=False, version=0)
 
     assert request.payload["input_ids"] == req.input_ids

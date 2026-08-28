@@ -85,9 +85,7 @@ class SGLangBackend:
                 continue
             collapsed.append(token_id)
         if collapsed.count(image_token_id) != len(req.image_data):
-            raise ValueError(
-                "Qwen2.5-VL image placeholders do not match image_data"
-            )
+            raise ValueError("Qwen2.5-VL image placeholders do not match image_data")
         return collapsed
 
     def build_generation_request(

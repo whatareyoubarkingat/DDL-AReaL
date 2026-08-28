@@ -1071,9 +1071,7 @@ class FSDPEngine(TrainEngine):
         # Transformers may copy the config internally, but both serialized
         # configs must describe the scalar-head architecture.
         self.model_config.num_labels = 1
-        self.model_config.architectures = [
-            "AReaLQwen2_5_VLForTokenClassification"
-        ]
+        self.model_config.architectures = ["AReaLQwen2_5_VLForTokenClassification"]
         self.model_config.areal_model_role = "critic"
         return AReaLQwen2_5_VLForTokenClassification.from_pretrained(
             config=self.model_config,

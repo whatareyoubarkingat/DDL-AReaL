@@ -169,9 +169,7 @@ def test_qwen25_vl_critic_warmstarts_and_reloads_scalar_head(tmp_path):
     reloaded = reload_engine._create_vision_actor_or_critic(torch.float32)
     assert reloaded.score.weight.shape == (1, 32)
     assert torch.equal(reloaded.score.weight, critic.score.weight)
-    assert reload_config.architectures == [
-        "AReaLQwen2_5_VLForTokenClassification"
-    ]
+    assert reload_config.architectures == ["AReaLQwen2_5_VLForTokenClassification"]
     assert reload_config.areal_model_role == "critic"
 
 
