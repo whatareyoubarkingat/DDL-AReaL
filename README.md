@@ -190,10 +190,10 @@ For comprehensive setup instructions, see
 
 ### Vision-Language Models
 
-| Task                                | Description                                               | Performance                                     |
-| ----------------------------------- | --------------------------------------------------------- | ----------------------------------------------- |
-| **[VLM](examples/vlm/)**            | Geometry3K and CLEVR Count 70K visual reasoning with GRPO | -                                               |
-| **[VLM on NPU](examples/vlm_npu/)** | VLM training on Huawei NPU hardware                       | [Benchmark Results](examples/vlm_npu/README.md) |
+| Task                                | Description                                               | Guide                                                 |
+| ----------------------------------- | --------------------------------------------------------- | ----------------------------------------------------- |
+| **[VLM](examples/vlm/)**            | Geometry3K and CLEVR Count 70K visual reasoning with GRPO | [Qwen2.5-VL PPO](docs/en/reference/qwen2_5_vl_ppo.md) |
+| **[VLM on NPU](examples/vlm_npu/)** | VLM training on Huawei NPU hardware                       | [Benchmark Results](examples/vlm_npu/README.md)       |
 
 ### Alignment & Infrastructure
 
