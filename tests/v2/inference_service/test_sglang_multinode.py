@@ -53,6 +53,17 @@ class TestSGLangMultiNode:
         assert args["node_rank"] == 0
         assert args.get("dist_init_addr") is None
 
+    def test_build_args_passes_chat_template(self):
+        """SGLang receives an explicitly configured chat template."""
+        args = self._build_args(
+            sglang_config=SGLangConfig(
+                model_path="test-model",
+                chat_template="/tmp/custom-chat-template.jinja",
+            )
+        )
+
+        assert args["chat_template"] == "/tmp/custom-chat-template.jinja"
+
     def test_build_args_multi_node_head(self):
         """Head node (rank 0) with n_nodes > 1 should set nnodes and dist_init_addr."""
         args = self._build_args(

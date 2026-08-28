@@ -34,7 +34,7 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.hf_utils import load_hf_tokenizer
+from areal.utils.hf_utils import configure_hf_chat_template, load_hf_tokenizer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, gethostip
 
@@ -274,6 +274,7 @@ def _setup_openai_client():
     config = _engine.config
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     agent_cfg = config.agent
+    configure_hf_chat_template(tokenizer, agent_cfg.chat_template_path)
     _openai_client = ArealOpenAI(
         engine=_engine,
         tokenizer=tokenizer,

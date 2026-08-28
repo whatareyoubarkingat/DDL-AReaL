@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal, overload
 
 import transformers
@@ -11,6 +12,31 @@ import areal.utils.logging as logging
 from areal.utils import pkg_version
 
 logger = logging.getLogger("HFUtils")
+
+
+def configure_hf_chat_template(
+    tokenizer: transformers.PreTrainedTokenizerFast,
+    chat_template_path: str | None,
+) -> transformers.PreTrainedTokenizerFast:
+    """Override a tokenizer's chat template from a validated UTF-8 Jinja file."""
+    if chat_template_path is None:
+        return tokenizer
+
+    template_path = Path(chat_template_path).expanduser()
+    if not template_path.is_file():
+        raise FileNotFoundError(
+            f"Chat template path is not a readable file: {template_path}"
+        )
+
+    try:
+        chat_template = template_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Chat template must be valid UTF-8: {template_path}") from exc
+    if not chat_template.strip():
+        raise ValueError(f"Chat template file is empty: {template_path}")
+
+    tokenizer.chat_template = chat_template
+    return tokenizer
 
 
 @overload

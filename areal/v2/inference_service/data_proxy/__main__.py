@@ -36,6 +36,10 @@ def main():
         required=True,
     )
     parser.add_argument(
+        "--chat-template-path",
+        default=None,
+    )
+    parser.add_argument(
         "--log-level",
         default="warning",
     )
@@ -92,6 +96,7 @@ def main():
         backend_addr=args.backend_addr,
         backend_type=args.backend_type,
         tokenizer_path=args.tokenizer_path,
+        chat_template_path=args.chat_template_path,
         log_level=args.log_level,
         request_timeout=args.request_timeout,
         set_reward_finish_timeout=args.set_reward_finish_timeout,

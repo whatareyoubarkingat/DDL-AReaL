@@ -2072,6 +2072,15 @@ class SGLangConfig:
     """
 
     model_path: str = ""
+    chat_template: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Chat template passed to the SGLang server. May be a template "
+                "string or path supported by SGLang."
+            )
+        },
+    )
     random_seed: int = 1
     skip_tokenizer_init: bool = False
     disable_cuda_graph: bool = False
@@ -2285,6 +2294,15 @@ class AgentConfig:
         metadata={
             "help": "Chat template type: 'hf' (standard) or 'concat' (multi-turn concatenation).",
             "choices": ["hf", "concat"],
+        },
+    )
+    chat_template_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to a UTF-8 Jinja chat template that overrides the Hugging "
+                "Face tokenizer template."
+            )
         },
     )
     engine_max_tokens: int | None = field(

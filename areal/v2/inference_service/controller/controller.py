@@ -477,6 +477,11 @@ class RolloutControllerV2:
                 "--engine-max-tokens",
                 str(agent_cfg.engine_max_tokens),
             ]
+        if agent_cfg.chat_template_path is not None:
+            data_proxy_base_cmd += [
+                "--chat-template-path",
+                agent_cfg.chat_template_path,
+            ]
 
         async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
             if self.external_mode:

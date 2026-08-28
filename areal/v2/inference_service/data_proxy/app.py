@@ -339,7 +339,10 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             app.state.inf_bridge = None
             app.state.areal_client = None
         else:
-            tok = TokenizerProxy(config.tokenizer_path)
+            tok = TokenizerProxy(
+                config.tokenizer_path,
+                chat_template_path=config.chat_template_path,
+            )
             inf_bridge = _create_inf_bridge(config.backend_addr, pause_state, config)
             areal_client = _create_areal_client(inf_bridge, tok, config)
             app.state.tokenizer = tok

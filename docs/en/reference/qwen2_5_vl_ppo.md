@@ -12,7 +12,8 @@ The implementation covers three boundaries:
 1. a scalar Qwen2.5-VL critic for FSDP;
 1. Qwen-VL position and mRoPE compatibility with Transformers 5.3; and
 1. capability-based image-placeholder normalization at the AReaL-to-SGLang request
-   boundary.
+   boundary; and
+1. a shared tool-aware chat-template override for SGLang and the rollout tokenizer.
 
 The actor path remains unchanged. A vision actor is still loaded with
 `AutoModelForImageTextToText`; only `is_critic=true` selects the scalar value model.
@@ -87,6 +88,28 @@ unchanged for log-probability and training alignment.
 If no processor is available, AReaL cannot safely infer the image token ID. It emits a
 `RuntimeWarning` and leaves the request tokens unchanged. Callers should provide the
 processor for multimodal requests.
+
+## Tool Chat-Template Alignment
+
+Some Qwen2.5-VL snapshots ship a multimodal template that ignores `tools`, assistant
+`tool_calls`, and tool results. A tool parser only parses generated output; it cannot
+restore schemas that were omitted from the prompt. AReaL therefore supports two explicit
+overrides that should point to the same shared Jinja file:
+
+```yaml
+sglang:
+  chat_template: <TOOL_AWARE_CHAT_TEMPLATE.jinja>
+
+rollout:
+  agent:
+    chat_template_path: <TOOL_AWARE_CHAT_TEMPLATE.jinja>
+```
+
+`sglang.chat_template` configures server-side request rendering.
+`rollout.agent.chat_template_path` configures the AReaL data-proxy tokenizer used for
+prompt token accounting and trajectory alignment. Setting only one side can produce
+different prompt token IDs between serving and training. The path must be a readable,
+non-empty UTF-8 file visible to every rollout node.
 
 ## Critic Configuration
 

@@ -378,6 +378,7 @@ class TestRolloutControllerV2Construction:
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
                 set_reward_finish_timeout=7.5,
+                chat_template_path="/tmp/custom-chat-template.jinja",
             ),
             scheduling_spec=(
                 SchedulingSpec(
@@ -418,6 +419,8 @@ class TestRolloutControllerV2Construction:
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd
         assert "http://127.0.0.1:19000" in data_proxy_cmd
+        assert "--chat-template-path" in data_proxy_cmd
+        assert "/tmp/custom-chat-template.jinja" in data_proxy_cmd
 
 
 class TestOnlineCallbackFlow:
