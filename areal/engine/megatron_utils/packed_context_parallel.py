@@ -302,7 +302,11 @@ def extract_vision_from_multi_modal(
 
     if multi_modal_input is not None:
         for key in _VLM_FORWARD_KEYS:
-            items = [item[key] for item in multi_modal_input if key in item]
+            items = [
+                item[key]
+                for item in multi_modal_input
+                if item is not None and key in item
+            ]
             if items:
                 padded_mb[key] = torch.cat(items, dim=0)
 

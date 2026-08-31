@@ -210,7 +210,11 @@ def _prepare_multimodal_forward_inputs(
 
     if multi_modal_input is not None:
         for key in _MULTIMODAL_FORWARD_KEYS:
-            values = [item[key] for item in multi_modal_input if key in item]
+            values = [
+                item[key]
+                for item in multi_modal_input
+                if item is not None and key in item
+            ]
             if values:
                 padded_mb[key] = torch.cat(values, dim=0)
 
@@ -1961,14 +1965,14 @@ class FSDPEngine(TrainEngine):
                 image_grid_thw_list = [
                     m["image_grid_thw"]
                     for m in multi_modal_input
-                    if "image_grid_thw" in m
+                    if m is not None and "image_grid_thw" in m
                 ]
                 if image_grid_thw_list:
                     image_grid_thw = torch.cat(image_grid_thw_list)
                 video_grid_thw_list = [
                     m["video_grid_thw"]
                     for m in multi_modal_input
-                    if "video_grid_thw" in m
+                    if m is not None and "video_grid_thw" in m
                 ]
                 if video_grid_thw_list:
                     video_grid_thw = torch.cat(video_grid_thw_list)

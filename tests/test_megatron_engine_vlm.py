@@ -180,6 +180,33 @@ class TestExtractVisionFromMultiModal:
         assert "multi_modal_input" not in mb
         assert "multi_modal_input" not in padded_mb
 
+    def test_skips_text_only_samples_in_mixed_batch(self):
+        """None entries represent text-only samples in a multimodal batch."""
+        from areal.engine.megatron_utils.packed_context_parallel import (
+            extract_vision_from_multi_modal,
+        )
+
+        pixel_values = torch.randn(2, 4)
+        image_grid_thw = torch.tensor([[1, 1, 2]])
+        mb: dict[str, Any] = {
+            "multi_modal_input": [
+                None,
+                {
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                },
+                None,
+            ]
+        }
+        padded_mb: dict[str, Any] = dict(mb)
+
+        extract_vision_from_multi_modal(mb, padded_mb)
+
+        assert "multi_modal_input" not in mb
+        assert "multi_modal_input" not in padded_mb
+        assert torch.equal(padded_mb["pixel_values"], pixel_values)
+        assert torch.equal(padded_mb["image_grid_thw"], image_grid_thw)
+
     def test_falls_back_to_padded_mb(self):
         """When mb lacks multi_modal_input but padded_mb has it, the fallback
         branch should still concatenate vision tensors onto padded_mb."""
