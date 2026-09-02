@@ -241,6 +241,7 @@ class TrainEngine(abc.ABC):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        max_attempts_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare a batch of data for training from a dataloader.
 
@@ -261,6 +262,9 @@ class TrainEngine(abc.ABC):
             If True, enables dynamic batch sizing. The method will stop collecting
             when (accepted + rejected) >= batch_size, returning only accepted results.
             This results in variable-sized batches of valid data. Default is False.
+        max_attempts_per_batch : int | None, optional
+            Maximum accepted plus rejected rollout attempts for one fixed-size batch.
+            ``None`` preserves unlimited retries.
 
         Returns
         -------
@@ -893,6 +897,7 @@ class InferenceEngine(abc.ABC):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        max_attempts_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready with controlled staleness.
 
@@ -936,6 +941,9 @@ class InferenceEngine(abc.ABC):
             If True, enables dynamic batch sizing. The method will stop collecting
             when (accepted + rejected) >= batch_size, returning only accepted results.
             This results in variable-sized batches of valid data. Default is False.
+        max_attempts_per_batch : int | None, optional
+            Maximum accepted plus rejected rollout attempts for one fixed-size batch.
+            ``None`` preserves unlimited retries.
 
         Returns
         -------

@@ -3323,9 +3323,23 @@ class PPOConfig(BaseExperimentConfig):
             "This results in variable-sized batches of valid data."
         },
     )
+    max_attempts_per_batch: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum accepted plus rejected rollout attempts while preparing one "
+            "training batch. If the limit is reached before a full fixed-size batch is "
+            "collected, preparation fails instead of retrying indefinitely. None preserves "
+            "the unlimited retry behavior. This does not impose a wall-clock timeout."
+        },
+    )
 
     def __post_init__(self):
         """Validate the eval generation config."""
+        if self.max_attempts_per_batch is not None and self.max_attempts_per_batch <= 0:
+            raise ValueError(
+                "max_attempts_per_batch must be positive or None, got "
+                f"{self.max_attempts_per_batch}"
+            )
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
         if self.gconfig.reward_normalization and self.actor.reward_norm is not None:

@@ -157,6 +157,13 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                     http_client=http_client,
                     api_key=session_api_key,
                 )
+                if rewards is None:
+                    logger.info(
+                        "Agent rejected session %s in group %s; skipping reward.",
+                        session_id,
+                        group_id,
+                    )
+                    return None
                 if isinstance(rewards, dict):
                     final_reward = float(
                         next(reversed(rewards.values())) if rewards else 0.0

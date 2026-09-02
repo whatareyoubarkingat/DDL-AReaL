@@ -637,6 +637,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         input_generator: Generator[TInput, None, None],
         batch_size: int,
         dynamic_bs: bool = False,
+        max_attempts_per_batch: int | None = None,
     ) -> list[TResult]:
         """Continuously submit tasks and wait until a full batch of results is ready.
 
@@ -655,6 +656,16 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             If True, enables dynamic batch sizing. The method will stop collecting
             when (accepted + rejected) >= batch_size, returning only accepted results.
             This results in variable-sized batches of valid data. Default is False.
+        max_attempts_per_batch : int | None, optional
+            Maximum number of accepted plus rejected results consumed while preparing
+            this batch. When fixed-size batching cannot collect ``batch_size`` accepted
+            results within the limit, a ``RuntimeError`` is raised. ``None`` preserves
+            unlimited retries. Dynamic batching still stops after ``batch_size`` total
+            attempts, or this limit when it is lower. The counters are local to this
+            invocation and also cap newly submitted tasks. Existing queued/running work
+            is not charged merely for being present, but its result counts if consumed
+            by this invocation. This is not a wall-clock timeout; a submitted task may
+            still take arbitrarily long to finish.
 
         Returns
         -------
@@ -666,13 +677,47 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         Raises
         ------
         RuntimeError
-            If the input generator is exhausted before the batch is complete.
+            If the input generator is exhausted or the attempt limit is reached before
+            a fixed-size batch is complete.
         """
+        if max_attempts_per_batch is not None and max_attempts_per_batch <= 0:
+            raise ValueError(
+                "max_attempts_per_batch must be positive or None, got "
+                f"{max_attempts_per_batch}"
+            )
+        if (
+            not dynamic_bs
+            and max_attempts_per_batch is not None
+            and max_attempts_per_batch < batch_size
+        ):
+            raise ValueError(
+                "max_attempts_per_batch must be at least batch_size for fixed-size "
+                f"batching, got {max_attempts_per_batch} < {batch_size}"
+            )
+
+        attempt_limit = max_attempts_per_batch
+        if dynamic_bs:
+            attempt_limit = (
+                batch_size if attempt_limit is None else min(batch_size, attempt_limit)
+            )
+
         accepted_cnt = 0
         total_attempts = 0
+        submitted_attempts = 0
         results = []
 
         while True:
+            if attempt_limit is not None and total_attempts >= attempt_limit:
+                if dynamic_bs:
+                    break
+                rejected_cnt = total_attempts - accepted_cnt
+                raise RuntimeError(
+                    "Unable to collect a full rollout batch within "
+                    f"max_attempts_per_batch={attempt_limit}: "
+                    f"accepted={accepted_cnt}, rejected={rejected_cnt}, "
+                    f"batch_size={batch_size}."
+                )
+
             # Submit tasks to maintain overlap
             with self._input_cv:
                 pending_inputs = len(self._pending_inputs)
@@ -692,16 +737,23 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         category="scheduler",
                         args={"data": capacity},
                     )
-                for _ in range(min(batch_size, capacity)):
+                submit_count = min(batch_size, capacity)
+                if attempt_limit is not None:
+                    submit_count = min(submit_count, attempt_limit - submitted_attempts)
+                for _ in range(submit_count):
                     try:
                         self.submit_task_input(next(input_generator))
+                        submitted_attempts += 1
                     except StopIteration:
                         raise RuntimeError(
                             "Input generator exhausted before batch completion. "
                             "Use cycle_dataloader() or provide an infinite generator."
                         ) from None
+            wait_count = batch_size - accepted_cnt
+            if attempt_limit is not None:
+                wait_count = min(wait_count, attempt_limit - total_attempts)
             try:
-                arrived = self.wait_results(count=batch_size - accepted_cnt, timeout=1)
+                arrived = self.wait_results(count=wait_count, timeout=1)
             except TimeoutError:
                 arrived = []
 
@@ -709,10 +761,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 is_accepted = res is not None
 
                 if not is_accepted:
-                    if dynamic_bs:
-                        total_attempts += 1
-                        if total_attempts >= batch_size:
-                            break
+                    total_attempts += 1
                     continue
 
                 # Accepted sample
@@ -720,14 +769,18 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 total_attempts += 1
                 results.append(res)
 
+            if accepted_cnt >= batch_size:
+                break
+            if attempt_limit is not None and total_attempts >= attempt_limit:
                 if dynamic_bs:
-                    if total_attempts >= batch_size:
-                        break
-                elif accepted_cnt >= batch_size:
                     break
-            else:
-                continue
-            break
+                rejected_cnt = total_attempts - accepted_cnt
+                raise RuntimeError(
+                    "Unable to collect a full rollout batch within "
+                    f"max_attempts_per_batch={attempt_limit}: "
+                    f"accepted={accepted_cnt}, rejected={rejected_cnt}, "
+                    f"batch_size={batch_size}."
+                )
 
         return results
 
@@ -1370,6 +1423,7 @@ class WorkflowExecutor:
         workflow: RolloutWorkflow,
         should_accept_fn: Callable[[dict[str, Any]], bool] = None,
         dynamic_bs: bool = False,
+        max_attempts_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
@@ -1417,7 +1471,14 @@ class WorkflowExecutor:
         # Delegate to dispatcher
         assert dataloader.batch_size is not None
         results = self.dispatcher.active_submit_and_wait(
-            self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
+            self.data_generator,
+            batch_size=dataloader.batch_size,
+            dynamic_bs=dynamic_bs,
+            **(
+                {"max_attempts_per_batch": max_attempts_per_batch}
+                if max_attempts_per_batch is not None
+                else {}
+            ),
         )
 
         # Return list of trajectory dicts (filter out None)

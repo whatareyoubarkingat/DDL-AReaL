@@ -99,6 +99,47 @@ class DistRolloutCoordinator:
         self.rollout_engine = rollout_engine
         self.train_engine = train_engine
 
+    def _raise_if_any_rollout_failed(
+        self,
+        local_error: BaseException | None,
+    ) -> None:
+        """Synchronize head-side rollout failures before tensor collectives.
+
+        Only data-parallel heads execute the rollout engine, but every training rank
+        subsequently enters redistribution and broadcast collectives.  A head must
+        therefore report an exception to all ranks before any of those collectives
+        begin, otherwise peers can wait until the process-group timeout.
+        """
+        local_failure = None
+        if local_error is not None:
+            local_failure = {
+                "rank": dist.get_rank(group=self.train_engine.cpu_group),
+                "type": type(local_error).__name__,
+                "message": str(local_error),
+            }
+
+        failures: list[dict[str, Any] | None] = [None] * dist.get_world_size(
+            group=self.train_engine.cpu_group
+        )
+        dist.all_gather_object(
+            failures,
+            local_failure,
+            group=self.train_engine.cpu_group,
+        )
+        remote_failures = [failure for failure in failures if failure is not None]
+        if not remote_failures:
+            return
+
+        # Preserve the original exception on the rank that encountered it.  Peers
+        # raise a deterministic summary after participating in the same collective.
+        if local_error is not None:
+            raise local_error
+        summary = "; ".join(
+            f"rank {failure['rank']} {failure['type']}: {failure['message']}"
+            for failure in remote_failures
+        )
+        raise RuntimeError(f"Rollout failed on a data-parallel head: {summary}")
+
     def _broadcast_and_redistribute_trajectories(
         self,
         trajectories: list[dict[str, Any]] | None,
@@ -192,18 +233,24 @@ class DistRolloutCoordinator:
         """
 
         trajectories = None
-        if self.train_engine.is_data_parallel_head():
-            trajectories = self.rollout_engine.rollout_batch(
-                data,
-                workflow=workflow,
-                workflow_kwargs=workflow_kwargs,
-                group_size=group_size,
-                reward_normalization=reward_normalization,
-                drop_incomplete_group=drop_incomplete_group,
-            )
-            trajectories = tensor_container_to(
-                trajectories, current_platform.current_device()
-            )
+        local_error = None
+        try:
+            if self.train_engine.is_data_parallel_head():
+                trajectories = self.rollout_engine.rollout_batch(
+                    data,
+                    workflow=workflow,
+                    workflow_kwargs=workflow_kwargs,
+                    group_size=group_size,
+                    reward_normalization=reward_normalization,
+                    drop_incomplete_group=drop_incomplete_group,
+                )
+                trajectories = tensor_container_to(
+                    trajectories, current_platform.current_device()
+                )
+        except BaseException as exc:
+            local_error = exc
+
+        self._raise_if_any_rollout_failed(local_error)
 
         return self._broadcast_and_redistribute_trajectories(trajectories)
 
@@ -217,6 +264,7 @@ class DistRolloutCoordinator:
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        max_attempts_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare async rollout batch with distributed coordination.
 
@@ -253,19 +301,30 @@ class DistRolloutCoordinator:
         """
 
         trajectories = None
-        if self.train_engine.is_data_parallel_head():
-            trajectories = self.rollout_engine.prepare_batch(
-                dataloader,
-                workflow=workflow,
-                workflow_kwargs=workflow_kwargs,
-                should_accept_fn=should_accept_fn,
-                group_size=group_size,
-                dynamic_bs=dynamic_bs,
-                reward_normalization=reward_normalization,
-                drop_incomplete_group=drop_incomplete_group,
-            )
-            trajectories = tensor_container_to(
-                trajectories, current_platform.current_device()
-            )
+        local_error = None
+        try:
+            if self.train_engine.is_data_parallel_head():
+                trajectories = self.rollout_engine.prepare_batch(
+                    dataloader,
+                    workflow=workflow,
+                    workflow_kwargs=workflow_kwargs,
+                    should_accept_fn=should_accept_fn,
+                    group_size=group_size,
+                    dynamic_bs=dynamic_bs,
+                    reward_normalization=reward_normalization,
+                    drop_incomplete_group=drop_incomplete_group,
+                    **(
+                        {"max_attempts_per_batch": max_attempts_per_batch}
+                        if max_attempts_per_batch is not None
+                        else {}
+                    ),
+                )
+                trajectories = tensor_container_to(
+                    trajectories, current_platform.current_device()
+                )
+        except BaseException as exc:
+            local_error = exc
+
+        self._raise_if_any_rollout_failed(local_error)
 
         return self._broadcast_and_redistribute_trajectories(trajectories)

@@ -50,7 +50,7 @@ trainer.train(workflow="my_module.MyAgent")
 `run` 方法必须遵循此签名：
 
 ```python
-async def run(self, data: dict, **extra_kwargs) -> float | dict[str, float]
+async def run(self, data: dict, **extra_kwargs) -> float | dict[str, float] | None
 ```
 
 | 参数           | 描述                                     |
@@ -59,6 +59,9 @@ async def run(self, data: dict, **extra_kwargs) -> float | dict[str, float]
 | `extra_kwargs` | AReaL 注入的参数（见下文）               |
 | **返回**       | `float`：最后一个补全的奖励              |
 |                | `dict[str, float]`：将补全 ID 映射到奖励 |
+|                | `None`：拒绝该轨迹，不进入训练           |
+
+返回 `None` 时 AReaL 仍会结束并导出代理会话以完成清理，但不会写入 reward 0，也不会生成训练样本。
 
 ### 注入的参数
 

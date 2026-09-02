@@ -435,6 +435,7 @@ Rewards can be assigned in two ways:
 
    - `float`: Applied to last completion
    - `dict[str, float]`: Maps completion IDs to rewards
+   - `None`: Rejects the trajectory; no reward or training sample is emitted
 
 1. **Explicit API calls** (direct approach):
 

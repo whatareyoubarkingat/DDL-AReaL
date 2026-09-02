@@ -678,6 +678,7 @@ class RemoteSGLangEngine(InferenceEngine):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        max_attempts_per_batch: int | None = None,
     ):
         """Asynchronously submit and wait until a full batch is ready."""
         return self._engine.prepare_batch(
@@ -689,6 +690,11 @@ class RemoteSGLangEngine(InferenceEngine):
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            **(
+                {"max_attempts_per_batch": max_attempts_per_batch}
+                if max_attempts_per_batch is not None
+                else {}
+            ),
         )
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:

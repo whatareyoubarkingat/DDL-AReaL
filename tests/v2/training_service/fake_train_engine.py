@@ -100,6 +100,7 @@ class FakeTrainEngine(TrainEngine):
         should_accept_fn=None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        max_attempts_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         return []
 

@@ -70,13 +70,13 @@ class AgentWorkflow(ABC, metaclass=_DeprecatedAgentWorkflowMeta):
 
     To use agent-based workflows, simply implement a class with::
 
-        async def run(self, data: dict[str, Any], **extra_kwargs: Any) -> dict[str, float] | float
+        async def run(self, data: dict[str, Any], **extra_kwargs: Any) -> dict[str, float] | float | None
     """
 
     @abstractmethod
     async def run(
         self, data: dict[str, Any], **extra_kwargs: Any
-    ) -> dict[str, float] | float:
+    ) -> dict[str, float] | float | None:
         """Run an agent with any SDK, e.g., OpenAI SDK.
 
         `data` contains the input data for the agent, which may
@@ -98,8 +98,9 @@ class AgentWorkflow(ABC, metaclass=_DeprecatedAgentWorkflowMeta):
 
         Returns
         -------
-        dict[str, float] | float
-            The final reward or a dictionary of reward keyed by response ID
+        dict[str, float] | float | None
+            The final reward, a dictionary of reward keyed by response ID, or
+            ``None`` to reject the trajectory without assigning a reward.
         """
         raise NotImplementedError()
 

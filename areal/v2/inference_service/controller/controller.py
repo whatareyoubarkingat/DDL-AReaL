@@ -1227,6 +1227,7 @@ class RolloutControllerV2:
         batch_size: int | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        max_attempts_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare a full training batch by consuming data from a dataloader.
 
@@ -1249,6 +1250,9 @@ class RolloutControllerV2:
             Number of times to run the workflow per input (default ``1``).
         dynamic_bs : bool
             Enable dynamic batch sizing (default ``False``).
+        max_attempts_per_batch : int | None
+            Maximum accepted plus rejected rollout attempts for one batch.
+            ``None`` preserves unlimited retries.
         batch_size : int | None
             Batch size for the dummy dataloader when ``dataloader`` is
             ``None``.  **Required** when ``dataloader`` is ``None``.
@@ -1285,6 +1289,11 @@ class RolloutControllerV2:
             workflow=resolved_workflow,
             should_accept_fn=resolved_accept_fn,
             dynamic_bs=dynamic_bs,
+            **(
+                {"max_attempts_per_batch": max_attempts_per_batch}
+                if max_attempts_per_batch is not None
+                else {}
+            ),
         )
         # Return list of trajectories (matching RolloutController API)
         return [r for r in results if r is not None]

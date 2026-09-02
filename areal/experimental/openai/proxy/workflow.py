@@ -223,6 +223,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             task_id=str(task_id),
             admin_api_key=self._admin_api_key,
         )
+        rejected = False
         async with proxy_client:
             # Run the user code.
             try:
@@ -236,8 +237,12 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 )
                 raise
 
-            # Assign rewards back according to user code output
-            if isinstance(rewards, dict):
+            # ``None`` is an explicit rejection signal. Do not attach a reward;
+            # the session is still ended and exported below so that the proxy can
+            # clean up its session and API-key mappings.
+            if rewards is None:
+                rejected = True
+            elif isinstance(rewards, dict):
                 for completion_id, reward in rewards.items():
                     await proxy_client.set_reward(completion_id, reward)
             elif isinstance(rewards, float):
@@ -251,6 +256,10 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             style=self.export_style,
             drop_retry_orphans=self.drop_retry_orphans,
         )
+
+        if rejected:
+            logger.info("Agent rejected trajectory; exported only for proxy cleanup.")
+            return None
 
         # Record stats
         last_id = list(interactions.keys())[-1] if interactions else None

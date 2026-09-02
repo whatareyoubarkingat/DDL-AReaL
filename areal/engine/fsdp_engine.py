@@ -228,6 +228,35 @@ def _fallback_qwen_vl_position_ids(attention_mask: torch.Tensor) -> torch.Tensor
     return position_ids.unsqueeze(0).expand(3, -1, -1).contiguous()
 
 
+def _compute_qwen_vl_position_ids(
+    model: Any,
+    *,
+    input_ids: torch.Tensor,
+    image_grid_thw: torch.Tensor | None,
+    video_grid_thw: torch.Tensor | None,
+    attention_mask: torch.Tensor,
+    mm_token_type_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Compute positions for one independent packed Qwen-VL training batch."""
+    # Transformers keeps rope_deltas on the model for autoregressive decoding.
+    # FSDP training batches are independent, so carrying a multimodal delta into
+    # a later text-only batch gives incorrect positions and, in Transformers 5.3,
+    # dereferences the intentionally absent inputs_embeds argument.
+    model.rope_deltas = None
+    position_ids = model.compute_3d_position_ids(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        attention_mask=attention_mask,
+        mm_token_type_ids=mm_token_type_ids,
+        inputs_embeds=None,
+        past_key_values=None,
+    )
+    if position_ids is None:
+        position_ids = _fallback_qwen_vl_position_ids(attention_mask)
+    return position_ids
+
+
 def _validate_fsdp_critic_lora(config: TrainEngineConfig) -> None:
     """Reject critic LoRA before FSDP creates or loads a model."""
     if config.is_critic and config.use_lora:
@@ -627,6 +656,7 @@ class FSDPEngine(TrainEngine):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        max_attempts_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
@@ -638,6 +668,11 @@ class FSDPEngine(TrainEngine):
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            **(
+                {"max_attempts_per_batch": max_attempts_per_batch}
+                if max_attempts_per_batch is not None
+                else {}
+            ),
         )
 
     def update_weights(self, meta: WeightUpdateMeta):
@@ -1977,17 +2012,14 @@ class FSDPEngine(TrainEngine):
                 if video_grid_thw_list:
                     video_grid_thw = torch.cat(video_grid_thw_list)
 
-            position_ids = self.model.model.compute_3d_position_ids(
+            position_ids = _compute_qwen_vl_position_ids(
+                self.model.model,
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
                 attention_mask=attn_mask,
                 mm_token_type_ids=input_["mm_token_type_ids"],
-                inputs_embeds=None,
-                past_key_values=None,
             )
-            if position_ids is None:
-                position_ids = _fallback_qwen_vl_position_ids(attn_mask)
             position_ids = torch.einsum("ijk->jki", position_ids)
             input_["position_ids"] = position_ids
         else:

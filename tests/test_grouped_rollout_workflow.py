@@ -127,6 +127,11 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
     coordinator = DistRolloutCoordinator(rollout_engine, _TrainEngine())
     monkeypatch.setattr(
         coordinator,
+        "_raise_if_any_rollout_failed",
+        lambda local_error: None,
+    )
+    monkeypatch.setattr(
+        coordinator,
         "_broadcast_and_redistribute_trajectories",
         lambda trajectories: trajectories,
     )
@@ -150,3 +155,74 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
     assert rollout_engine.prepare_kwargs["drop_incomplete_group"] is True
     assert rollout_engine.rollout_kwargs["reward_normalization"] is True
     assert rollout_engine.rollout_kwargs["drop_incomplete_group"] is True
+
+
+def test_dist_rollout_coordinator_synchronizes_head_failure(monkeypatch):
+    """A local head error is synchronized before any tensor collective."""
+
+    class _FailingRolloutEngine(_RolloutEngine):
+        def prepare_batch(self, *args, **kwargs):
+            raise ValueError("attempt limit reached")
+
+    class _DistributedTrainEngine(_TrainEngine):
+        cpu_group = object()
+
+    train_engine = _DistributedTrainEngine()
+    coordinator = DistRolloutCoordinator(_FailingRolloutEngine(), train_engine)
+    monkeypatch.setattr(dist_rollout.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(
+        dist_rollout.dist,
+        "get_world_size",
+        lambda group: 2,
+    )
+
+    def all_gather_object(output, payload, *, group):
+        assert group is train_engine.cpu_group
+        output[:] = [payload, None]
+
+    monkeypatch.setattr(dist_rollout.dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(
+        coordinator,
+        "_broadcast_and_redistribute_trajectories",
+        lambda trajectories: pytest.fail(
+            "tensor collective must not run after failure"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="attempt limit reached"):
+        coordinator.prepare_batch(
+            dataloader=object(),
+            workflow=object(),
+            max_attempts_per_batch=12,
+        )
+
+
+def test_dist_rollout_coordinator_raises_remote_head_failure(monkeypatch):
+    """A non-head rank receives a deterministic error from the failed head."""
+
+    class _DistributedTrainEngine(_TrainEngine):
+        cpu_group = object()
+
+    train_engine = _DistributedTrainEngine()
+    coordinator = DistRolloutCoordinator(_RolloutEngine(), train_engine)
+    monkeypatch.setattr(
+        dist_rollout.dist,
+        "get_world_size",
+        lambda group: 2,
+    )
+
+    def all_gather_object(output, payload, *, group):
+        assert payload is None
+        assert group is train_engine.cpu_group
+        output[:] = [
+            {"rank": 0, "type": "RuntimeError", "message": "attempt limit reached"},
+            None,
+        ]
+
+    monkeypatch.setattr(dist_rollout.dist, "all_gather_object", all_gather_object)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"rank 0 RuntimeError: attempt limit reached",
+    ):
+        coordinator._raise_if_any_rollout_failed(None)

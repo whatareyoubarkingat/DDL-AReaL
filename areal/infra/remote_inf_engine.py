@@ -1351,6 +1351,7 @@ class RemoteInfEngine(InferenceEngine):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        max_attempts_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready.
 
@@ -1394,6 +1395,11 @@ class RemoteInfEngine(InferenceEngine):
             workflow=resolved_workflow,
             should_accept_fn=resolved_should_accept_fn,
             dynamic_bs=dynamic_bs,
+            **(
+                {"max_attempts_per_batch": max_attempts_per_batch}
+                if max_attempts_per_batch is not None
+                else {}
+            ),
         )
 
     @trace_perf("remote_inf_engine.pause_generation", category="misc")

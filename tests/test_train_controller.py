@@ -593,6 +593,7 @@ class TestTrainControllerRolloutIntegration:
             dataloader=mock_dataloader,
             workflow="test.workflow",
             workflow_kwargs={"key": "value"},
+            max_attempts_per_batch=12,
         )
 
         mock_rollout.prepare_batch.assert_called_once_with(
@@ -604,7 +605,38 @@ class TestTrainControllerRolloutIntegration:
             group_size=1,
             reward_normalization=False,
             drop_incomplete_group=False,
+            max_attempts_per_batch=12,
         )
+
+    def test_prepare_batch_default_supports_legacy_rollout_signature(
+        self, train_controller, ft_spec
+    ):
+        """The default does not send the new kwarg to legacy rollout wrappers."""
+
+        class LegacyRollout:
+            def prepare_batch(
+                self,
+                dataloader,
+                workflow,
+                workflow_kwargs,
+                should_accept_fn,
+                group_size,
+                dynamic_bs,
+                reward_normalization,
+                drop_incomplete_group,
+            ):
+                return ["legacy-result"]
+
+        train_controller.initialize(role="train_worker", ft_spec=ft_spec)
+        train_controller.rollout = LegacyRollout()
+
+        result = train_controller.prepare_batch(
+            dataloader=Mock(),
+            workflow="test.workflow",
+            workflow_kwargs={},
+        )
+
+        assert result == ["legacy-result"]
 
     def test_rollout_batch_delegates_to_rollout(self, train_controller, ft_spec):
         """Test rollout_batch delegates to rollout controller."""

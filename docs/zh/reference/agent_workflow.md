@@ -416,6 +416,7 @@ class InteractionWithTokenLogpReward:
 
    - `float`：应用于最后回复
    - `dict[str, float]`：将 completion ID 映射到奖励
+   - `None`：拒绝该轨迹，不写 reward，也不生成训练样本
 
 1. **显式 API 调用**（直接方式）：
 

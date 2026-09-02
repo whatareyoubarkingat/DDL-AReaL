@@ -51,7 +51,7 @@ trainer.train(workflow="my_module.MyAgent")
 The `run` method must follow this signature:
 
 ```python
-async def run(self, data: dict, **extra_kwargs) -> float | dict[str, float]
+async def run(self, data: dict, **extra_kwargs) -> float | dict[str, float] | None
 ```
 
 | Parameter      | Description                                           |
@@ -60,6 +60,10 @@ async def run(self, data: dict, **extra_kwargs) -> float | dict[str, float]
 | `extra_kwargs` | AReaL-injected arguments (see below)                  |
 | **Return**     | `float`: reward for last completion                   |
 |                | `dict[str, float]`: maps completion IDs to rewards    |
+|                | `None`: reject this trajectory from training          |
+
+Returning `None` still closes and exports the proxy session for cleanup, but AReaL does
+not attach a zero reward or create a training sample.
 
 ### Injected Arguments
 

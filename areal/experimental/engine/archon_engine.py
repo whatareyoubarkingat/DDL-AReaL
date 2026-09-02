@@ -714,6 +714,7 @@ class ArchonEngine(TrainEngine):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        max_attempts_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare batch from dataloader with rollout."""
         self._check_rollout_engine_connected()
@@ -726,6 +727,11 @@ class ArchonEngine(TrainEngine):
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            **(
+                {"max_attempts_per_batch": max_attempts_per_batch}
+                if max_attempts_per_batch is not None
+                else {}
+            ),
         )
 
     def clear_batches(self, shard_ids: list[str] | None = None) -> None:

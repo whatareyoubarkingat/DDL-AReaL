@@ -641,6 +641,44 @@ class TestInferenceServiceWorkflow:
             mock_http_session, ["sess-1"], group_id="grp-test-1"
         )
 
+    @pytest.mark.asyncio
+    async def test_offline_mode_none_rejects_without_setting_reward(self):
+        controller = MagicMock()
+
+        class RejectingAgent:
+            async def run(self, data, **kwargs):
+                return None
+
+        workflow = InferenceServiceWorkflow(
+            controller=controller,
+            agent=RejectingAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("grp-test-1", [("sess-1", "sess-api-key-1")])
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value={"discarded": MagicMock()}
+        )
+
+        with patch(
+            "areal.v2.inference_service.controller.workflow.workflow_context"
+        ) as mock_wf_ctx:
+            mock_http_session = AsyncMock()
+            mock_wf_ctx.get_aiohttp_session = AsyncMock(return_value=mock_http_session)
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        assert result is None
+        workflow._set_last_reward.assert_not_awaited()
+        workflow._export_interactions.assert_awaited_once_with(
+            mock_http_session, ["sess-1"], group_id="grp-test-1"
+        )
+
 
 # =============================================================================
 # Multi-node inference configuration

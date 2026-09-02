@@ -694,15 +694,22 @@ class PPOTrainer:
                     },
                 ),
             ):
+                prepare_batch_kwargs: dict[str, Any] = {
+                    "workflow": workflow,
+                    "workflow_kwargs": workflow_kwargs,
+                    "should_accept_fn": dynamic_filter_fn,
+                    "group_size": config.gconfig.n_samples,
+                    "dynamic_bs": self.config.dynamic_bs,
+                    "reward_normalization": config.gconfig.reward_normalization,
+                    "drop_incomplete_group": config.gconfig.drop_incomplete_group,
+                }
+                if self.config.max_attempts_per_batch is not None:
+                    prepare_batch_kwargs["max_attempts_per_batch"] = (
+                        self.config.max_attempts_per_batch
+                    )
                 rollout_batch = self.actor.prepare_batch(
                     self.train_dataloader,
-                    workflow=workflow,
-                    workflow_kwargs=workflow_kwargs,
-                    should_accept_fn=dynamic_filter_fn,
-                    group_size=config.gconfig.n_samples,
-                    dynamic_bs=self.config.dynamic_bs,
-                    reward_normalization=config.gconfig.reward_normalization,
-                    drop_incomplete_group=config.gconfig.drop_incomplete_group,
+                    **prepare_batch_kwargs,
                 )
             if self._should_offload_rollout:
                 self._offload_rollout()
