@@ -228,6 +228,46 @@ def _fallback_qwen_vl_position_ids(attention_mask: torch.Tensor) -> torch.Tensor
     return position_ids.unsqueeze(0).expand(3, -1, -1).contiguous()
 
 
+def _resolve_qwen_vl_token_types(
+    batch: dict[str, Any], model_config: Any
+) -> torch.Tensor:
+    """Allow legacy text rollout exports without inventing visual metadata.
+
+    SFT/vision workflows supply token types, but the OpenAI proxy's text
+    interaction export does not. Zero types are correct only when neither
+    active vision placeholder tokens nor a visual payload are present.
+    """
+    supplied = batch.get("mm_token_type_ids")
+    if supplied is not None:
+        return supplied
+
+    input_ids = batch["input_ids"]
+    active_ids = input_ids[batch["attention_mask"].bool()]
+    vision_ids = [
+        getattr(model_config, key, None) for key in ("image_token_id", "video_token_id")
+    ]
+    if any(not isinstance(token_id, int) for token_id in vision_ids):
+        raise ValueError(
+            "mm_token_type_ids is missing and Qwen-VL vision token IDs "
+            "are unavailable; cannot establish that this batch is text-only"
+        )
+    has_vision_tokens = any((active_ids == token_id).any() for token_id in vision_ids)
+    has_vision_payload = any(
+        item is not None and bool(item)
+        for item in (batch.get("multi_modal_input") or [])
+    ) or any(
+        batch.get(key) is not None
+        for key in (*_MULTIMODAL_FORWARD_KEYS, "pixel_values_videos")
+    )
+    if has_vision_tokens or has_vision_payload:
+        raise ValueError(
+            "mm_token_type_ids is required for a multimodal Qwen-VL batch; "
+            "the rollout producer must preserve processor token types and "
+            "visual tensors instead of treating image/video tokens as text"
+        )
+    return torch.zeros_like(input_ids, dtype=torch.long)
+
+
 def _compute_qwen_vl_position_ids(
     model: Any,
     *,
@@ -282,6 +322,7 @@ class FSDPEngine(TrainEngine):
         self._initialized = False
         self.own_global_group = False
         self._cpu_group: dist.ProcessGroup
+        self._cpu_model_parallel_group: dist.ProcessGroup | None = None
         self.weight_update_group_initialized = False
         self.weight_update_group_names: list[str] = []
         self.weight_update_groups: list = []
@@ -416,11 +457,33 @@ class FSDPEngine(TrainEngine):
         self.dp_head = dist.get_process_group_ranks(self.mp_group)[0]
         self.dp_rank = dist.get_rank(self.dp_group)
 
+        self._init_cpu_model_parallel_group()
+
         self.logger.info(f"Data parallel head {self.dp_head} and rank {self.dp_rank}")
 
         # Eagerly initialize HCCL/NCCL communicators for the subgroups so
         # that lazy init doesn't race with colocated engines (issue #1099).
         warmup_process_groups(self.dp_group, self.sp_group, self.mp_group)
+
+    def _init_cpu_model_parallel_group(self) -> None:
+        """Mirror each actual SP/TP group for RPC while TMS has paused CUDA."""
+        self._cpu_model_parallel_group = None
+        if not (self.config.offload or is_tms_enabled()):
+            return
+        memberships = [None] * dist.get_world_size(self._cpu_group)
+        dist.all_gather_object(
+            memberships,
+            dist.get_process_group_ranks(self.mp_group),
+            group=self._cpu_group,
+        )
+        # Every rank creates every subgroup in the same order. Use actual rank
+        # membership, not an assumed contiguous DP/CP/TP/EP mesh layout.
+        for ranks in sorted({tuple(ranks) for ranks in memberships}):
+            group = dist.new_group(
+                list(ranks), backend="gloo", timeout=DIST_GROUP_DEFAULT_TIMEOUT
+            )
+            if self.rank in ranks:
+                self._cpu_model_parallel_group = group
 
     def initialize(self, addr: str | None, ft_spec: FinetuneSpec, *args, **kwargs):
         # Initialize distributed enviroments and load model.
@@ -536,6 +599,14 @@ class FSDPEngine(TrainEngine):
 
         self._initialized = True
 
+        # Full-model loading precedes FSDP sharding. Cached allocations belong
+        # to this process and cannot be reused by colocated critic/ref workers.
+        # Release temporary state references and unused allocator blocks before
+        # the controller initializes the next model; keep live FP32 shards.
+        full_state = None
+        current_platform.clear_memory()
+        self.get_device_stats().log("after model initialization/cache release")
+
     @property
     def data_parallel_group(self) -> dist.ProcessGroup:
         return self.dp_group
@@ -553,11 +624,19 @@ class FSDPEngine(TrainEngine):
         return self.mp_group
 
     @property
+    def cpu_model_parallel_group(self) -> dist.ProcessGroup | None:
+        return self._cpu_model_parallel_group
+
+    @property
     def cpu_group(self) -> dist.ProcessGroup:
         assert self._initialized
         return self._cpu_group
 
     def destroy(self):
+        # TMS cannot free unmapped allocations. Restore them before releasing
+        # parameters/optimizer tensors (including their allocator cache blocks).
+        if getattr(self, "is_offload", False):
+            self.onload()
         self._initialized = False
         if hasattr(self, "optimizer"):
             del self.optimizer
@@ -796,7 +875,7 @@ class FSDPEngine(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
-        for mb_item in mb_list:
+        for mb_item, is_padding_slot in self._synchronized_microbatch_slots(mb_list):
             inputs, ctx = self._prepare_mb_inputs(mb_item)
 
             # Lazily create tree attention metadata just before forward.
@@ -813,6 +892,7 @@ class FSDPEngine(TrainEngine):
                 )
                 inputs.update(tree_kwargs)
                 tree_attn_keys = list(tree_kwargs.keys())
+                del tree_kwargs
 
             with trace_scope("fsdp_engine.forward"):
                 outputs = self.model(**inputs)
@@ -823,11 +903,48 @@ class FSDPEngine(TrainEngine):
                 del inputs[key]
 
             ctx_dict = ctx.to_dict()
-            loss = process_output_fn(logits, ctx_dict)
+            if is_padding_slot:
+                # Participate in the same FSDP forward/backward collectives as
+                # longer DP shards without adding a sample, loss weight, metric,
+                # or result. FP32 reduction avoids low-precision sum overflow.
+                loss = None if forward_only else logits.sum(dtype=torch.float32) * 0.0
+            else:
+                loss = process_output_fn(logits, ctx_dict)
 
             if not forward_only and loss is not None:
                 with trace_scope("fsdp_engine.backward"):
                     loss.backward()
+
+            # Assignment evaluates the next model forward before replacing the
+            # previous outputs. Drop both the output and its logits view here so
+            # two full sequence-by-vocabulary tensors cannot overlap. Backward
+            # has already consumed the graph; callbacks retain their own results.
+            del loss, logits, outputs, ctx_dict, ctx, inputs
+
+    def _synchronized_microbatch_slots(
+        self, mb_list: MicroBatchList
+    ) -> Iterator[tuple[MicroBatchItem, bool]]:
+        """Align FSDP execution counts while preserving the real batch metadata."""
+        items = list(mb_list)
+        counts = [len(items)]
+        if dist.is_initialized():
+            counts = [None] * dist.get_world_size(self.cpu_group)
+            dist.all_gather_object(counts, len(items), group=self.cpu_group)
+        if not all(counts):
+            raise ValueError("FSDP requires a nonempty microbatch list on every rank")
+        yield from ((item, False) for item in items)
+        padding_slots = max(counts) - len(items)
+        if padding_slots:
+            # Reuse a legal local input, including its multimodal/CP metadata.
+            # Do not synthesize or truncate tokens, or append it to mb_list.mbs.
+            template = min(items, key=lambda item: item.padded_mb["input_ids"].numel())
+            self.logger.info(
+                "Aligning FSDP execution: %s real microbatches, %s zero-loss slots",
+                len(items),
+                padding_slots,
+            )
+            for _ in range(padding_slots):
+                yield template, True
 
     def train_batch(
         self,
@@ -988,6 +1105,8 @@ class FSDPEngine(TrainEngine):
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/fsdp_utils/actor.py
         """
+        if self.is_offload:
+            return
         if not is_tms_enabled():
             raise RuntimeError(
                 "torch_memory_saver requires `enable_offload=True` in yaml config."
@@ -998,12 +1117,11 @@ class FSDPEngine(TrainEngine):
         # Use torch_memory_saver to pause CUDA memory
         current_platform.clear_memory()
         torch_memory_saver.pause()
+        self.is_offload = True
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
         self.get_device_stats().log("after offload model")
-
-        self.is_offload = True
 
     def onload(self) -> None:
         """Onload model memory from CPU back to GPU using torch_memory_saver.
@@ -1011,13 +1129,14 @@ class FSDPEngine(TrainEngine):
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/fsdp_utils/actor.py
         """
 
+        if not self.is_offload:
+            return
         torch_memory_saver.resume()
+        self.is_offload = False
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
         self.get_device_stats().log("after onload model")
-
-        self.is_offload = False
 
     def clear_batches(self, shard_ids: list[str] | None = None) -> None:
         """Drain this worker's client-side RTensor fetch buffer.
@@ -1993,6 +2112,9 @@ class FSDPEngine(TrainEngine):
             if input_ids.dtype != torch.long:
                 input_ids = input_ids.to(torch.long)
                 input_["input_ids"] = input_ids
+            input_["mm_token_type_ids"] = _resolve_qwen_vl_token_types(
+                input_, self.model_config
+            )
             image_grid_thw = None
             video_grid_thw = None
             if "multi_modal_input" in input_:
@@ -2025,7 +2147,14 @@ class FSDPEngine(TrainEngine):
         else:
             input_ = amend_position_ids(input_)
 
-        mb_list = split_padded_tensor_dict_into_mb_list(input_, self.config.mb_spec)
+        # CP/TP ranks share input rows; different DP shards need not have equal
+        # row counts. Align execution later, rather than requesting more nonempty
+        # groups than a short shard has rows.
+        mb_list = split_padded_tensor_dict_into_mb_list(
+            input_,
+            self.config.mb_spec,
+            group=self.mp_group if dist.is_initialized() else None,
+        )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         mb_list = pad_mb_list(
             mb_list,
@@ -2345,7 +2474,11 @@ class FSDPPPOActor(FSDPEngine):
 
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
-        return self.actor.compute_logp(*args, **kwargs)
+        result = self.actor.compute_logp(*args, **kwargs)
+        # Colocated roles are separate processes with separate allocator caches.
+        # Release unused blocks after the inner call's microbatches leave scope.
+        current_platform.clear_memory()
+        return result
 
     @torch.no_grad()
     def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
@@ -2353,6 +2486,7 @@ class FSDPPPOActor(FSDPEngine):
 
     def ppo_update(self, *args, **kwargs) -> None:
         self.actor.ppo_update(*args, **kwargs)
+        current_platform.clear_memory()
 
     def sft_train_batch(self, data: list) -> dict:
         import torch
@@ -2429,10 +2563,13 @@ class FSDPPPOCritic(FSDPEngine):
 
     @torch.no_grad()
     def compute_values(self, *args, **kwargs) -> torch.Tensor:
-        return self.critic.compute_values(*args, **kwargs)
+        result = self.critic.compute_values(*args, **kwargs)
+        current_platform.clear_memory()
+        return result
 
     def ppo_update(self, *args, **kwargs) -> None:
         self.critic.ppo_update(*args, **kwargs)
+        current_platform.clear_memory()
 
     @classmethod
     def as_controller(cls, config: PPOCriticConfig, scheduler: Scheduler):

@@ -72,6 +72,59 @@ ordinary positions from the attention mask and materializes three identical axes
 contiguous storage. Padding positions remain zero. Processor-provided multimodal
 positions are preserved.
 
+Text-only OpenAI-proxy exports may omit `mm_token_type_ids`. FSDP supplies zeros only
+after checking that the active tokens contain no image/video placeholders and that there
+is no visual payload. This applies to actor, reference, and critic microbatch
+preparation without modifying the shared rollout batch. Missing types on a multimodal
+batch still fail explicitly: zero-filling is not a substitute for transporting processor
+token types, image grids, and pixel tensors. In particular, a successful text-only proxy
+test does not validate multimodal proxy training.
+
+## Long-Sequence Memory
+
+FSDP releases microbatch-local model outputs and logits views before starting the next
+forward. Retaining either reference would overlap two full sequence-by-vocabulary
+tensors, even in reference-model inference. This does not change the loss or tensor
+precision, and does not clear the CUDA allocator cache on every microbatch. After
+successful PPO log-probability, value, and update calls, unused allocator blocks are
+released once at the role boundary so another colocated process can use them. Live
+outputs, gradients, model parameters, and optimizer state remain resident; cache release
+is not parameter or optimizer offloading.
+
+For long TMS-enabled gradient accumulation, set `pad_to_maximum=true` with an explicit
+`mb_spec.max_tokens_per_mb` (for example, 65536). Reusing fixed buffer shapes reduces
+variable-size allocator cache growth. Real token positions, loss weights and batch
+membership are preserved; the independent padding segment is cropped from results. This
+trades extra padded computation for predictable buffer reuse without per-microbatch host
+synchronization. Do not insert unsynchronized `empty_cache()` calls between
+microbatches: pending CUDA work can still reference TMS mappings being reclaimed.
+
+DP shards can contain different numbers of exported agent turns. FSDP packs real
+microbatches within each CP/TP group, then aligns execution counts across ranks. Shorter
+shards repeat a legal local input only as a synchronization slot: its forward output is
+discarded and its backward loss is zero. These slots never enter the real batch
+metadata, output ordering, loss normalization, or PPO metrics. This does not fix
+mismatched vision/text module routing across DP groups.
+
+Reference forward success alone does not establish PPO memory capacity: actor backward
+retains additional activations, and the first optimizer step creates Adam states for
+both actor and critic. Validate subsequent long-sequence updates with those states
+resident, using the intended role colocation or offload settings.
+
+For TMS-enabled colocated PPO, set `enable_offload=true` together with the per-role
+`offload` flags. The trainer offloads critic after value computation, restores it for
+the critic update, and offloads it again afterwards. If actor offload is requested,
+actor is offloaded around the critic update and restored before weight synchronization
+and saving. Handoffs occur in the controller after RPC results return, preserving
+serialized outputs and updated optimizer state. TMS-enabled FSDP also creates Gloo
+mirrors of the actual SP/TP rank groups. RPC payloads use these CPU groups while a role
+is offloaded, and resume using device groups while resident. The world-wide CPU barrier
+group cannot substitute for a per-DP model-parallel mirror: that would mix different DP
+payloads or deadlock. Repeated FSDP offload/onload calls are idempotent. Teardown
+restores paused TMS allocations before freeing model and optimizer storage; if
+restoration fails, the error propagates to scheduler cleanup instead of freeing unmapped
+GPU allocations.
+
 ## SGLang Image Placeholders
 
 A Hugging Face Qwen-VL processor can expand one image placeholder into a consecutive run
@@ -162,12 +215,27 @@ contract.
 
 ## Targeted Validation
 
+FSDP initialization releases temporary full-state references and unused device allocator
+cache after sharding and optimizer construction. This one-time handoff allows separately
+colocated actor, critic and reference processes to load without retaining each preceding
+model's full-weight loading cache. Live FP32 master shards, optimizer settings and BF16
+compute are unchanged. The runtime logs device memory after this handoff; this is not a
+guarantee that a full long-context PPO update fits in memory.
+
+PPO trainer cleanup accepts partially initialized trainers. It attempts every available
+resource cleanup and finally deletes only workers owned by that trainer's scheduler, in
+reverse rank order. Cleanup errors never mask an earlier construction or training
+exception; on an otherwise successful run, cleanup errors still fail the run. Repeated
+close calls skip successful cleanup operations and retry failed ones. CPU coverage lives
+in `tests/test_ppo_trainer_cleanup.py`.
+
 The CPU compatibility tests are:
 
 ```bash
 pytest -q \
   tests/test_fsdp_qwen2_5_vl_critic.py \
   tests/test_qwen2_vl_transformers_compat.py \
+  tests/test_fsdp_proxy_token_types.py \
   tests/test_sglang_vlm_request.py
 ```
 

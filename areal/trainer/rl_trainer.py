@@ -117,7 +117,10 @@ class PPOTrainer:
                 "created workers",
                 exc_info=True,
             )
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                logger.exception("Cleanup after PPOTrainer construction failure failed")
             raise
 
     def _init_impl(
@@ -729,7 +732,10 @@ class PPOTrainer:
                     for traj, v in zip(rollout_batch, values):
                         traj["values"] = v
                     self.critic.get_device_stats().log("critic values")
-                # Critic stays onloaded — offloaded after ppo_update below
+                # RPC results are already materialized before releasing the
+                # critic's GPU storage for reference and actor computation.
+                if self._should_offload_critic:
+                    self._offload_model(self.critic, role="critic")
 
             if self.ref is not None:
                 if self._should_offload_ref:
@@ -845,6 +851,10 @@ class PPOTrainer:
                 logger.info(f"Memory snapshots saved to {snapshot_dir}")
 
             if self.critic is not None:
+                if self._should_offload_actor:
+                    self._offload_model(self.actor, role="actor")
+                if self._should_offload_critic:
+                    self._onload_model(self.critic, role="critic")
                 with (
                     stats_tracker.record_timing("critic_train_step"),
                     perf_tracer.trace_scope(
@@ -858,6 +868,10 @@ class PPOTrainer:
                     self.critic.get_device_stats().log("ppo critic update")
                 if self._should_offload_critic:
                     self._offload_model(self.critic, role="critic")
+                # Weight synchronization and checkpointing below require the
+                # actor onloaded again, with its updated optimizer state intact.
+                if self._should_offload_actor:
+                    self._onload_model(self.actor, role="actor")
 
             # Save BEFORE update_weights. In AWEX colocate mode the
             # transfer ends with actor weights offloaded, so saving afterwards
@@ -1002,25 +1016,59 @@ class PPOTrainer:
             )
 
     def close(self):
-        self.saver.finalize()
-        if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
-            self._train_rdataset.close()
-        if hasattr(self, "_valid_rdataset") and self._valid_rdataset is not None:
-            self._valid_rdataset.close()
-        if hasattr(self, "data_controller") and self.data_controller is not None:
-            self.data_controller.destroy()
-        self.stats_logger.close()
-        if self.eval_rollout is not None:
-            self.eval_rollout.destroy()
-        self.rollout.destroy()
-        if self.teacher is not None:
-            self.teacher.destroy()
-        if self.ref is not None:
-            self.ref.destroy()
-        if self.critic is not None:
-            self.critic.destroy()
-        self.actor.destroy()
-        perf_tracer.save(force=True)
+        """Release all owned resources, including partially initialized workers."""
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        completed = self.__dict__.setdefault("_completed_cleanup", set())
+        first_error = None
+
+        def cleanup(name, operation):
+            nonlocal first_error
+            if name in completed:
+                return
+            try:
+                operation()
+            except Exception as exc:
+                logger.exception("PPOTrainer cleanup failed for %s", name)
+                if first_error is None:
+                    first_error = exc
+            else:
+                completed.add(name)
+
+        try:
+            for name, method in (
+                ("saver", "finalize"),
+                ("_train_rdataset", "close"),
+                ("_valid_rdataset", "close"),
+                ("data_controller", "destroy"),
+                ("stats_logger", "close"),
+                ("eval_rollout", "destroy"),
+                ("rollout", "destroy"),
+                ("teacher", "destroy"),
+                ("ref", "destroy"),
+                ("critic", "destroy"),
+                ("actor", "destroy"),
+            ):
+                resource = getattr(self, name, None)
+                if resource is not None:
+                    cleanup(
+                        name,
+                        lambda resource=resource, method=method: getattr(
+                            resource, method
+                        )(),
+                    )
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None:
+                cleanup(
+                    "scheduler",
+                    lambda: scheduler.delete_workers(reverse_order=True),
+                )
+            cleanup("perf_tracer", lambda: perf_tracer.save(force=True))
+        finally:
+            self._closing = False
+        if first_error is not None:
+            raise first_error
 
     def _config_perf_tracer(self):
         rank = int(os.getenv("RANK", "0"))
@@ -1616,5 +1664,10 @@ class PPOTrainer:
     def __exit__(self, exc_type, exc_value, traceback):
         if exc_type is not None:
             logger.error(f"Training failed with exception: {exc_value}", exc_info=True)
-        self.close()
+            try:
+                self.close()
+            except Exception:
+                logger.exception("Cleanup after training failure failed")
+        else:
+            self.close()
         return False
