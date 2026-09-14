@@ -1186,7 +1186,11 @@ class FSDPEngine(TrainEngine):
 
         if self.config.is_critic:
             model_class = AutoModelForTokenClassification
-            model_kwargs = {"num_labels": 1}
+            # from_config forwards kwargs to the model constructor, which does
+            # not accept num_labels in Transformers 5. Set the config instead.
+            self.model_config = copy.deepcopy(self.model_config)
+            self.model_config.num_labels = 1
+            model_kwargs = {}
         else:
             model_class = AutoModelForCausalLM
             model_kwargs = {}
@@ -1205,9 +1209,12 @@ class FSDPEngine(TrainEngine):
         else:
             model = model_class.from_pretrained(
                 pretrained_model_name_or_path=self.config.path,
+                config=self.model_config,
                 trust_remote_code=True,
                 **model_kwargs,
             )
+        if self.config.is_critic:
+            self.model_config.architectures = [type(model).__name__]
         return model
 
     def _create_vision_actor_or_critic(self, dtype: torch.dtype):
