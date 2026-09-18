@@ -529,32 +529,12 @@ class FSDPEngine(TrainEngine):
         is_llm_cpu_load = (
             self.config.fsdp.memory_efficient_load
             and not self.config.init_from_scratch
-            and not self.is_vision_model
+            and self._supports_rank0_loading()
         )
 
         if is_llm_cpu_load or self.config.use_lora:
             need_broadcast = True
-            if dist.get_rank() == 0:
-                if is_llm_cpu_load:
-                    pretrained_state = get_state_dict_from_repo_id_or_path(
-                        self.config.path
-                    )
-                    missing, unexpected = self.model.load_state_dict(
-                        pretrained_state, strict=False
-                    )
-                    if missing:
-                        self.logger.warning(
-                            f"Missing keys when loading pretrained weights: {missing}"
-                        )
-                    if unexpected:
-                        self.logger.warning(
-                            f"Unexpected keys when loading pretrained weights: {unexpected}"
-                        )
-                    del pretrained_state
-                    gc.collect()
-                full_state = self.model.state_dict()
-            else:
-                full_state = {}
+            full_state = self._prepare_rank0_state_dict(load_pretrained=is_llm_cpu_load)
 
         # NOTE: This applies FSDP2 with N-D parallelism (DP+SP+TP)
         parallelize_model(
@@ -895,8 +875,7 @@ class FSDPEngine(TrainEngine):
                 del tree_kwargs
 
             with trace_scope("fsdp_engine.forward"):
-                outputs = self.model(**inputs)
-            logits = outputs.logits.squeeze(0)
+                logits = self._forward_microbatch(inputs)
 
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
@@ -907,7 +886,7 @@ class FSDPEngine(TrainEngine):
                 # Participate in the same FSDP forward/backward collectives as
                 # longer DP shards without adding a sample, loss weight, metric,
                 # or result. FP32 reduction avoids low-precision sum overflow.
-                loss = None if forward_only else logits.sum(dtype=torch.float32) * 0.0
+                loss = None if forward_only else self._zero_microbatch_loss(logits)
             else:
                 loss = process_output_fn(logits, ctx_dict)
 
@@ -919,7 +898,14 @@ class FSDPEngine(TrainEngine):
             # previous outputs. Drop both the output and its logits view here so
             # two full sequence-by-vocabulary tensors cannot overlap. Backward
             # has already consumed the graph; callbacks retain their own results.
-            del loss, logits, outputs, ctx_dict, ctx, inputs
+            del loss, logits, ctx_dict, ctx, inputs
+
+    def _forward_microbatch(self, inputs):
+        """Protected hook for engines returning compact token statistics."""
+        return self.model(**inputs).logits.squeeze(0)
+
+    def _zero_microbatch_loss(self, output):
+        return output.sum(dtype=torch.float32) * 0.0
 
     def _synchronized_microbatch_slots(
         self, mb_list: MicroBatchList
@@ -1265,7 +1251,7 @@ class FSDPEngine(TrainEngine):
             # Weights are broadcast from rank 0 after FSDP sharding in initialize().
             # Note: meta device optimization only applies to LLM (not VLM), because
             # VLM uses from_pretrained() which doesn't support meta device context.
-            if not self.is_vision_model and dist.get_rank() != 0:
+            if self._supports_rank0_loading() and dist.get_rank() != 0:
                 loading_device = "meta"
             else:
                 loading_device = "cpu"
@@ -1321,6 +1307,52 @@ class FSDPEngine(TrainEngine):
             f"Model creation and loading time: {time.perf_counter() - tik:.2f}s"
         )
         self.model = model
+
+    def _supports_rank0_loading(self):
+        return not self.is_vision_model
+
+    def _prepare_rank0_state_dict(self, *, load_pretrained: bool) -> dict:
+        """Agree on rank-zero load errors before any FSDP weight collective.
+
+        All ranks must call this, unlike the rank-zero-only loader hook. The
+        CPU group already exists here, but ``cpu_group``'s public property is
+        unavailable until initialization completes. Only a small error string
+        is broadcast; model tensors still use the normal FSDP loading path.
+        """
+        full_state = {}
+        error = [None]
+        cause = None
+        if dist.get_rank(self._cpu_group) == 0:
+            try:
+                if load_pretrained:
+                    self._load_rank0_pretrained_state()
+                    gc.collect()
+                full_state = self.model.state_dict()
+            except Exception as exc:
+                cause = exc
+                error[0] = f"{type(exc).__name__}: {exc}"
+        dist.broadcast_object_list(
+            error,
+            src=dist.get_global_rank(self._cpu_group, 0),
+            group=self._cpu_group,
+        )
+        if error[0] is not None:
+            raise RuntimeError(
+                f"Rank-zero checkpoint preparation failed: {error[0]}"
+            ) from cause
+        return full_state
+
+    def _load_rank0_pretrained_state(self):
+        pretrained_state = get_state_dict_from_repo_id_or_path(self.config.path)
+        missing, unexpected = self.model.load_state_dict(pretrained_state, strict=False)
+        if missing:
+            self.logger.warning(
+                f"Missing keys when loading pretrained weights: {missing}"
+            )
+        if unexpected:
+            self.logger.warning(
+                f"Unexpected keys when loading pretrained weights: {unexpected}"
+            )
 
     def _apply_peft_wrapper(self):
         config = self.config

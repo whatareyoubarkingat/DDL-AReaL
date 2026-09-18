@@ -32,6 +32,10 @@ from .rollout_controller import RolloutController
 
 logger = logging.getLogger("TrainController")
 
+# An engine stuck in an earlier collective cannot service its queued destroy
+# RPC. Bound that graceful phase before deleting this controller's workers.
+_ENGINE_DESTROY_TIMEOUT_SECONDS = 60.0
+
 
 def _find_in_structure(obj: Any, type_: type) -> Any | None:
     """Find first instance of type_ in a nested structure."""
@@ -413,7 +417,9 @@ class TrainController:
            ``dist.destroy_process_group()`` after a CPU barrier. This
            guarantees all ranks finish NCCL abort together before any store
            shuts down.
-        2. Workers are killed in reverse rank order so that rank-0 (owner
+        2. If graceful engine destruction stalls, stop waiting after 60 seconds
+           and still delete this controller's workers through its scheduler.
+        3. Workers are killed in reverse rank order so that rank-0 (owner
            of the global TCPStore server) receives SIGTERM last. This
            avoids the short window where non-zero ranks' HeartbeatMonitor
            threads poll a store whose TCP listener has already been closed.
@@ -434,7 +440,10 @@ class TrainController:
                         )
                         for rank, worker in enumerate(self.workers)
                     ]
-                    return await asyncio.gather(*tasks, return_exceptions=True)
+                    return await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=_ENGINE_DESTROY_TIMEOUT_SECONDS,
+                    )
 
                 results = run_async_task(_destroy_all_engines)
                 # Surface per-worker failures instead of silently swallowing them.
@@ -445,6 +454,10 @@ class TrainController:
                             f"{type(res).__name__}: {res}"
                         )
                 logger.info("Engines destroyed")
+            except TimeoutError:
+                logger.error(
+                    "Engine destruction timed out; deleting this controller's workers"
+                )
             except Exception as e:
                 logger.error(f"Error destroying engines: {e}")
 
