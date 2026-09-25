@@ -170,6 +170,35 @@ def _align_tools_with_sglang(tools_list: list) -> list[dict]:
 _DEFAULT_MAX_TOTAL_TOKENS = 32768
 
 
+def _split_native_reasoning_content(
+    output_text: str,
+    *,
+    prompt_suffix: str,
+    template_kwargs: Mapping[str, Any],
+) -> tuple[str | None, str]:
+    """Expose reasoning separately only for opted-in native thinking templates.
+
+    Rendering often supplies ``<think>`` in the prompt, so generated tokens need
+    not contain its opening tag. Never alter the underlying token/logprob record.
+    """
+    if "preserve_thinking" not in template_kwargs:
+        return None, output_text
+    if template_kwargs.get("enable_thinking") is False:
+        return None, output_text
+    stripped = output_text.lstrip()
+    if stripped.startswith("<think>"):
+        thinking_text = stripped[len("<think>") :]
+    elif prompt_suffix.rstrip().endswith("<think>"):
+        thinking_text = output_text
+    else:
+        return None, output_text
+    reasoning, closing, content = thinking_text.partition("</think>")
+    if not closing:
+        # A length/abort response can stop before the thinking block closes.
+        return reasoning or None, ""
+    return reasoning or None, content
+
+
 def _ensure_message_dict_list(
     name: str,
     value: list[Any],
@@ -592,6 +621,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         output_text: str,
         tool_calls: list | None,
         response: ModelResponse,
+        reasoning_content: str | None = None,
     ) -> tuple[ChatCompletion, ChatCompletionMessage]:
         """Build ChatCompletion and ChatCompletionMessage objects.
 
@@ -605,11 +635,17 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         Returns:
             A tuple of (ChatCompletion, ChatCompletionMessage).
         """
+        reasoning_fields = (
+            {"reasoning_content": reasoning_content}
+            if reasoning_content is not None
+            else {}
+        )
         output_message = ChatCompletionMessage(
             content=output_text,
             role="assistant",
             # For all empty tool calls, set tool_calls=None
             tool_calls=tool_calls or None,
+            **reasoning_fields,
         )
         chat_completion = ChatCompletion(
             id=completion_id,
@@ -901,6 +937,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         # Call inference engine
         response = await self.engine.agenerate(model_request)
         output_text = self.tokenizer.decode(response.output_tokens_without_stop)
+        template_kwargs = extra_body.get("chat_template_kwargs", {})
+        reasoning_content = None
+        if "preserve_thinking" in template_kwargs:
+            reasoning_content, output_text = _split_native_reasoning_content(
+                output_text,
+                prompt_suffix=self.tokenizer.decode(prompt_token_ids[-32:]),
+                template_kwargs=template_kwargs,
+            )
 
         # Parse tool calls.
         tool_calls = None
@@ -935,6 +979,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     output_text=output_text,
                     tool_calls=tool_calls,
                     response=response,
+                    reasoning_content=reasoning_content,
                 )
                 cache[completion_id].completion = chat_completion
                 cache[completion_id].model_response = response
@@ -947,6 +992,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 output_text=output_text,
                 tool_calls=tool_calls,
                 response=response,
+                reasoning_content=reasoning_content,
             )
 
         # Create proper ChatCompletion object with all required fields
@@ -956,6 +1002,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             output_text=output_text,
             tool_calls=tool_calls,
             response=response,
+            reasoning_content=reasoning_content,
         )
 
         if cache is not None:
@@ -973,6 +1020,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         output_text: str,
         tool_calls: list | None,
         response: ModelResponse,
+        reasoning_content: str | None = None,
     ) -> AsyncGenerator[ChatCompletionChunk, None]:
         """Generate streaming ChatCompletionChunk objects.
 
@@ -998,6 +1046,21 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 model="None",
                 object="chat.completion.chunk",
             )
+
+            if reasoning_content:
+                yield ChatCompletionChunk(
+                    id=completion_id,
+                    choices=[
+                        ChunkChoice(
+                            delta=ChoiceDelta(reasoning_content=reasoning_content),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                    created=current_time,
+                    model="None",
+                    object="chat.completion.chunk",
+                )
 
             # Content chunks - yield the full text as one chunk
             # (In a true streaming implementation, this would be broken into smaller pieces)

@@ -10,6 +10,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from areal.infra.platforms import current_platform
+from areal.utils import execution_diagnostics as diagnostics
 
 __all__ = [
     "fsdp2_clip_grad_norm",
@@ -253,13 +254,14 @@ def fsdp2_clip_grad_norm(
 
     grads_for_norm = get_main_grads_for_grad_norm(parameters, tensor_parallel_rank)
 
-    grad_norm = get_grad_norm_fp32(
-        grads_for_norm,
-        fsdp_group,
-        tp_group,
-        norm_type=norm_type,
-        offload_params=offload_params,
-    )
+    with diagnostics.scope("gradient_norm_collectives"):
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm,
+            fsdp_group,
+            tp_group,
+            norm_type=norm_type,
+            offload_params=offload_params,
+        )
 
     # Reduce gradient norm across PP stages
     if pp_group is not None:

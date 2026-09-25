@@ -2,6 +2,7 @@
 
 import asyncio
 import getpass
+import math
 import os
 import shlex
 import subprocess
@@ -10,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import aiohttp
 import orjson
@@ -45,6 +47,7 @@ from areal.infra.utils.launcher import (
     get_thread_env_vars,
 )
 from areal.infra.utils.proc import kill_process_tree, run_with_streaming_logs
+from areal.utils import execution_diagnostics as diagnostics
 from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
 from areal.utils.network import (
@@ -57,6 +60,40 @@ from areal.utils.offload import get_tms_env_vars
 logger = logging.getLogger("LocalScheduler")
 
 _MAX_STARTUP_PORT_CONFLICT_RETRIES = 3
+
+
+def _diagnostic_rpc_tags(
+    worker_id: str, engine_name: str, method: str
+) -> dict[str, Any]:
+    if not diagnostics.enabled():
+        return {}
+    return {
+        "request_id": uuid4().hex,
+        "worker_id": worker_id,
+        "engine_name": engine_name,
+        "method": method,
+    }
+
+
+def _diagnostic_rpc_payload(
+    payload: dict[str, Any], tags: dict[str, Any], http_timeout: float
+) -> dict[str, Any]:
+    """Copy diagnostic metadata without mutating caller-owned broadcast controls."""
+    if not tags:
+        return payload
+    supplied = payload.get("rpc_meta")
+    if supplied is not None and not isinstance(supplied, dict):
+        return payload  # Leave existing validation/error handling unchanged.
+    rpc_meta = dict(supplied or {})
+    rpc_meta["execution_diagnostics"] = {
+        **tags,
+        "http_timeout_s": http_timeout,
+    }
+    if type(http_timeout) in (int, float) and math.isfinite(http_timeout):
+        rpc_meta["execution_diagnostics"]["http_deadline_unix_s"] = (
+            time.time() + http_timeout
+        )
+    return {**payload, "rpc_meta": rpc_meta}
 
 
 @dataclass
@@ -1465,6 +1502,8 @@ class LocalScheduler(Scheduler):
         if engine_name is None:
             engine_name = worker_id
 
+        diagnostic_tags = _diagnostic_rpc_tags(worker_id, engine_name, method)
+
         # Serialize args and kwargs (convert tensors to SerializedTensor dicts)
         serialized_args = serialize_value(list(args))
         serialized_kwargs = serialize_value(kwargs)
@@ -1501,16 +1540,24 @@ class LocalScheduler(Scheduler):
                     f"Calling method '{method}' on worker '{worker_id}' (attempt {attempt})"
                 )
 
+                attempt_tags = (
+                    {**diagnostic_tags, "attempt": attempt} if diagnostic_tags else {}
+                )
+                diagnostics.event("rpc_client_send", **attempt_tags)
                 response = requests.post(
                     url,
-                    json=payload,
+                    json=_diagnostic_rpc_payload(payload, attempt_tags, http_timeout),
                     timeout=http_timeout,
+                )
+                diagnostics.event(
+                    "rpc_client_response", **attempt_tags, status=response.status_code
                 )
 
                 result, should_retry, error_msg = self._handle_call_response(
                     response, worker_id, method, attempt
                 )
                 if not should_retry:
+                    diagnostics.event("rpc_client_done", **attempt_tags)
                     if attempt > 1:
                         logger.debug(
                             f"Method '{method}' succeeded on worker '{worker_id}' "
@@ -1520,6 +1567,14 @@ class LocalScheduler(Scheduler):
                 last_error = error_msg
 
             except Exception as e:
+                diagnostics.event(
+                    "rpc_client_timeout"
+                    if isinstance(e, requests.exceptions.Timeout)
+                    else "rpc_client_error",
+                    **diagnostic_tags,
+                    attempt=attempt,
+                    error_type=type(e).__name__,
+                )
                 last_error = self._handle_call_exception(e, worker_info, worker_id)
 
             # Retry with exponential backoff
@@ -1594,6 +1649,8 @@ class LocalScheduler(Scheduler):
         if engine_name is None:
             engine_name = worker_id
 
+        diagnostic_tags = _diagnostic_rpc_tags(worker_id, engine_name, method)
+
         # Route to different endpoint based on method
         port = int(worker_info.worker.worker_ports[0])
         # Standard engine method call
@@ -1637,15 +1694,29 @@ class LocalScheduler(Scheduler):
                     read_bufsize=1024 * 1024 * 10,
                     connector=get_default_connector(),
                 ) as session:
+                    attempt_tags = (
+                        {**diagnostic_tags, "attempt": attempt}
+                        if diagnostic_tags
+                        else {}
+                    )
+                    diagnostics.event("rpc_client_send", **attempt_tags)
                     async with session.post(
                         url,
-                        json=payload,
+                        json=_diagnostic_rpc_payload(
+                            payload, attempt_tags, http_timeout
+                        ),
                         timeout=timeo,
                     ) as response:
+                        diagnostics.event(
+                            "rpc_client_response",
+                            **attempt_tags,
+                            status=response.status,
+                        )
                         # Handle response inline since aiohttp json() is async
                         if response.status == 200:
                             result_data = (await response.json()).get("result")
                             deserialized_result = deserialize_value(result_data)
+                            diagnostics.event("rpc_client_done", **attempt_tags)
                             if attempt > 1:
                                 logger.debug(
                                     f"Method '{method}' succeeded on worker '{worker_id}' "
@@ -1677,6 +1748,12 @@ class LocalScheduler(Scheduler):
                             last_error = f"HTTP {response.status}: {response_text}"
 
             except (aiohttp.ClientConnectionError, aiohttp.ClientConnectorError) as e:
+                diagnostics.event(
+                    "rpc_client_error",
+                    **diagnostic_tags,
+                    attempt=attempt,
+                    error_type=type(e).__name__,
+                )
                 # Check if worker died (forked workers have process=None)
                 if (
                     worker_info.process is not None
@@ -1690,10 +1767,28 @@ class LocalScheduler(Scheduler):
                     ) from e
                 last_error = f"Connection error: {e}"
             except TimeoutError as e:
+                diagnostics.event(
+                    "rpc_client_timeout",
+                    **diagnostic_tags,
+                    attempt=attempt,
+                    error_type=type(e).__name__,
+                )
                 last_error = f"Timeout: {e}"
-            except EngineCallError:
+            except EngineCallError as e:
+                diagnostics.event(
+                    "rpc_client_error",
+                    **diagnostic_tags,
+                    attempt=attempt,
+                    error_type=type(e).__name__,
+                )
                 raise
             except Exception as e:
+                diagnostics.event(
+                    "rpc_client_error",
+                    **diagnostic_tags,
+                    attempt=attempt,
+                    error_type=type(e).__name__,
+                )
                 last_error = f"Unexpected error: {e}"
 
             # Retry with exponential backoff

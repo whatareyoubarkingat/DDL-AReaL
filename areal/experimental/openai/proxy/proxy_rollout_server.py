@@ -10,7 +10,7 @@ import os
 import secrets
 import threading
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
@@ -26,7 +26,7 @@ from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response
 from openai.types.responses.response_create_params import ResponseCreateParams
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from areal.api.cli_args import NameResolveConfig
 from areal.experimental.openai.client import ArealOpenAI
@@ -555,6 +555,42 @@ def set_reward(
 # =============================================================================
 
 
+def _normalize_chat_template_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Restore the OpenAI SDK's flattened ``extra_body`` template options.
+
+    Only this named extension is lifted from the HTTP body; unsupported top-level
+    parameters still pass through the existing signature filter.
+    """
+    normalized = dict(kwargs)
+    extra_body = normalized.get("extra_body")
+    if extra_body is not None and not isinstance(extra_body, Mapping):
+        raise HTTPException(status_code=400, detail="extra_body must be an object")
+    extra_body = dict(extra_body or {})
+    nested = extra_body.get("chat_template_kwargs", {})
+    if not isinstance(nested, Mapping):
+        raise HTTPException(
+            status_code=400, detail="extra_body.chat_template_kwargs must be an object"
+        )
+    template_kwargs = dict(nested)
+    if "chat_template_kwargs" in normalized:
+        flattened = normalized.pop("chat_template_kwargs")
+        if not isinstance(flattened, Mapping):
+            raise HTTPException(
+                status_code=400, detail="chat_template_kwargs must be an object"
+            )
+        for key, value in flattened.items():
+            if key in template_kwargs and template_kwargs[key] != value:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Conflicting chat_template_kwargs value for {key!r}",
+                )
+            template_kwargs[key] = value
+        extra_body["chat_template_kwargs"] = template_kwargs
+    if extra_body or "extra_body" in normalized:
+        normalized["extra_body"] = extra_body
+    return normalized
+
+
 async def _call_client_create(
     create_fn,
     request: dict[str, Any] | BaseModel,
@@ -588,6 +624,7 @@ async def _call_client_create(
     )
 
     kwargs = request.model_dump() if isinstance(request, BaseModel) else dict(request)
+    kwargs = _normalize_chat_template_kwargs(kwargs)
     dropped_args = []
     for k, v in kwargs.items():
         if k not in areal_client_allowed_args:
@@ -644,7 +681,9 @@ async def _call_client_create(
     response_model=None,
 )
 async def chat_completions(
-    request: CompletionCreateParams, session_id: str = Depends(_require_session_key)
+    request: CompletionCreateParams,
+    raw_request: Request,
+    session_id: str = Depends(_require_session_key),
 ) -> ChatCompletion | StreamingResponse:
     """OpenAI-compatible chat completions endpoint.
 
@@ -657,6 +696,42 @@ async def chat_completions(
             status_code=500,
             detail='Proxy server not initialized. Send requests to /create_engine then /call "initialize" first.',
         )
+
+    # Keep the standard TypedDict validation, but restore the explicitly supported
+    # extensions that that schema may discard. OpenAI's SDK flattens extra_body
+    # into the HTTP JSON body, and native preserved-thinking templates also need
+    # the assistant reasoning field on subsequent turns.
+    raw_body = await raw_request.json()
+    request = dict(request)
+    if not isinstance(raw_body.get("messages"), list):
+        raise HTTPException(status_code=422, detail="messages must be a JSON array")
+    try:
+        # OpenAI declares Iterable[Message], which Pydantic validates lazily.
+        # Materialize once before restoring extensions; otherwise consuming it
+        # here leaves the model client with an exhausted message iterator.
+        request["messages"] = list(request["messages"])
+    except ValidationError as error:
+        raise RequestValidationError(error.errors()) from error
+    for key in ("chat_template_kwargs", "extra_body"):
+        if key in raw_body:
+            request[key] = raw_body[key]
+    request = _normalize_chat_template_kwargs(request)
+    template_kwargs = request.get("extra_body", {}).get("chat_template_kwargs", {})
+    if "preserve_thinking" in template_kwargs:
+        for message, raw_message in zip(
+            request["messages"], raw_body["messages"], strict=True
+        ):
+            if (
+                message.get("role") == "assistant"
+                and "reasoning_content" in raw_message
+            ):
+                reasoning = raw_message["reasoning_content"]
+                if reasoning is not None and not isinstance(reasoning, str):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="reasoning_content must be a string or null",
+                    )
+                message["reasoning_content"] = reasoning
 
     # CompletionCreateParams is a TypedDict (dict subclass), so use dict access.
     is_streaming = request.get("stream") is True

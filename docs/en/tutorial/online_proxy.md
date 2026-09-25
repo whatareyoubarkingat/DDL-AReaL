@@ -157,6 +157,40 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+#### Native chat-template options and preserved reasoning
+
+Pass model-native template settings through the OpenAI SDK's `extra_body`:
+
+```python
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "Inspect this task."}],
+    extra_body={
+        "chat_template_kwargs": {
+            "enable_thinking": True,
+            "reasoning_effort": "low",
+            "preserve_thinking": True,
+        }
+    },
+)
+```
+
+The SDK flattens `extra_body` into HTTP JSON. The worker restores `chat_template_kwargs`
+before calling the tokenizer; historical nested JSON is also accepted. Both forms must
+contain objects, and conflicting values return HTTP 400. Other unsupported top-level
+arguments still follow the existing filtering rules. In particular, the worker does not
+implicitly reinterpret a top-level `reasoning_effort` as a model-specific template
+setting.
+
+An explicit `preserve_thinking` option opts into separate `reasoning_content` in Chat
+Completions responses and stream deltas. Replay that field together with the assistant
+content and tool calls on the next turn (for example, append
+`response.choices[0].message.model_dump(exclude_none=True)`). The native template
+decides whether to include the history's thinking. The cached assistant message uses the
+same representation, while sampled token IDs and log probabilities remain unchanged.
+Without this option, legacy combined-content behavior is unchanged.
+`enable_thinking=False` does not classify plain answers as reasoning.
+
 ### Step 5: Assign a Reward and End the Session
 
 After the interaction, assign a reward to provide the RL training signal:

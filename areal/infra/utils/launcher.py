@@ -163,7 +163,20 @@ def get_env_vars(additional_env_vars: str | None = None) -> dict[str, str]:
 
     dynamic_pythonpath = os.pathsep.join(pythonpath_parts)
 
-    return {**BASE_ENVIRONS, "PYTHONPATH": dynamic_pythonpath, **_additional_env_vars}
+    diagnostic_env = {
+        key: os.environ[key]
+        for key in (
+            "AREAL_EXECUTION_DIAGNOSTICS_DIR",
+            "AREAL_EXECUTION_DIAGNOSTICS_STALL_SECONDS",
+        )
+        if key in os.environ
+    }
+    return {
+        **BASE_ENVIRONS,
+        "PYTHONPATH": dynamic_pythonpath,
+        **diagnostic_env,
+        **_additional_env_vars,
+    }
 
 
 class JobState(enum.Enum):

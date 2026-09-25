@@ -45,22 +45,34 @@ def chunked_policy_statistics(
         logp = logits.log_softmax(-1)
         selected = logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)
         entropy = -(logp.exp() * logp).sum(-1)
+        # Keep both differentiable statistics on one checkpoint output edge.
+        # PPO only differentiates selected logprobs. Separate outputs leave the
+        # unused entropy graph alive and retain its recomputed vocabulary-sized
+        # tensors until the entire microbatch output is released. A shared edge
+        # sends a zero gradient to an unused statistic and drains that cache.
         return (
-            selected,
-            entropy,
+            torch.stack((selected, entropy), dim=0),
             minimum,
             maximum,
         )
 
     chunks = []
-    for start in range(0, hidden.shape[-2], chunk_size):
-        x = hidden[..., start : start + chunk_size, :]
-        y = labels[..., start : start + chunk_size]
+    # One SplitBackward rejoins chunk gradients once. Independent slices would
+    # allocate a full-sequence hidden gradient for every small vocabulary chunk.
+    for x, y in zip(
+        hidden.split(chunk_size, dim=-2),
+        labels.split(chunk_size, dim=-1),
+        strict=True,
+    ):
         if torch.is_grad_enabled():
             chunks.append(checkpoint(project, x, y, use_reentrant=False))
         else:
             chunks.append(project(x, y))
-    return PolicyStatistics(*(torch.cat(xs, dim=-1) for xs in zip(*chunks)))
+    statistics, minimum, maximum = (
+        torch.cat(xs, dim=-1) for xs in zip(*chunks, strict=True)
+    )
+    selected, entropy = statistics.unbind(dim=0)
+    return PolicyStatistics(selected, entropy, minimum, maximum)
 
 
 @contextmanager

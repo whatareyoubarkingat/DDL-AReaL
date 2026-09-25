@@ -106,6 +106,9 @@ from areal.models.tree_attn.module import (
 )
 from areal.models.tree_attn.tree import TrieNode, build_packed_tree_batch
 from areal.utils import (
+    execution_diagnostics as diagnostics,
+)
+from areal.utils import (
     logging,
     name_resolve,
     names,
@@ -815,24 +818,25 @@ class FSDPEngine(TrainEngine):
         assert self.optimizer_config is not None
         assert self.lr_scheduler is not None
 
-        grad_norm = fsdp2_clip_grad_norm(
-            list(self.model.parameters()),
-            max_norm=self.optimizer_config.gradient_clipping,
-            fsdp_group=self.world_mesh["dp_sp"].get_group(),
-            tp_group=self.world_mesh["tp"].get_group(),
-            offload_params=self.config.fsdp.offload_params,
-        )
+        with diagnostics.scope("gradient_clip"):
+            grad_norm = fsdp2_clip_grad_norm(
+                list(self.model.parameters()),
+                max_norm=self.optimizer_config.gradient_clipping,
+                fsdp_group=self.world_mesh["dp_sp"].get_group(),
+                tp_group=self.world_mesh["tp"].get_group(),
+                offload_params=self.config.fsdp.offload_params,
+            )
 
         if not math.isfinite(grad_norm):
             self.optimizer_zero_grad()
             update_successful = False
         elif self.config.fsdp.per_layer_optim_step:
             assert self._per_layer_optim_wrapper is not None
-            with trace_scope("fsdp_engine.step"):
+            with diagnostics.scope("optimizer_step"), trace_scope("fsdp_engine.step"):
                 self._per_layer_optim_wrapper.step()
             update_successful = True
         else:
-            with trace_scope("fsdp_engine.step"):
+            with diagnostics.scope("optimizer_step"), trace_scope("fsdp_engine.step"):
                 self.optimizer.step()
             update_successful = True
 
@@ -855,50 +859,74 @@ class FSDPEngine(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
-        for mb_item, is_padding_slot in self._synchronized_microbatch_slots(mb_list):
-            inputs, ctx = self._prepare_mb_inputs(mb_item)
-
-            # Lazily create tree attention metadata just before forward.
-            # The returned dict keys are prefixed with "tree_" to avoid collisions
-            # with HuggingFace's own kwargs. The patched _tree_attn_fwd_func in
-            # module_fsdp.py reads these keys from the **kwargs that transformers
-            # forwards through.
-            tree_attn_keys: list[str] = []
-            if self.enable_tree_training and ctx.trie_node is not None:
-                padded_size = mb_item.padded_to_length
-                assert padded_size is not None
-                tree_kwargs = build_tree_attn_kwargs(
-                    ctx.trie_node, padded_size, self.device
+        rank = (
+            dist.get_rank(self.cpu_group)
+            if diagnostics.enabled() and dist.is_initialized()
+            else None
+        )
+        with diagnostics.context(rank=rank, forward_only=forward_only):
+            slots = self._synchronized_microbatch_slots(mb_list)
+            for slot, (mb_item, is_padding_slot) in enumerate(slots, start=1):
+                # Shapes are host metadata. Never retain tensors or synchronize
+                # CUDA merely to report progress. Durations are host wall time,
+                # not CUDA kernel timings; backward includes FSDP collectives.
+                metadata = (
+                    dict(
+                        microbatch=slot,
+                        real_microbatches=len(mb_list.mbs),
+                        padding_slot=is_padding_slot,
+                        input_tokens=mb_item.padded_mb["input_ids"].numel(),
+                        sequence_length=mb_item.padded_mb["input_ids"].shape[-1],
+                    )
+                    if diagnostics.enabled()
+                    else {}
                 )
-                inputs.update(tree_kwargs)
-                tree_attn_keys = list(tree_kwargs.keys())
-                del tree_kwargs
+                with diagnostics.context(**metadata), diagnostics.scope("microbatch"):
+                    with diagnostics.scope("prepare_microbatch"):
+                        inputs, ctx = self._prepare_mb_inputs(mb_item)
 
-            with trace_scope("fsdp_engine.forward"):
-                logits = self._forward_microbatch(inputs)
+                    # Lazily create tree attention metadata just before forward.
+                    tree_attn_keys: list[str] = []
+                    if self.enable_tree_training and ctx.trie_node is not None:
+                        padded_size = mb_item.padded_to_length
+                        assert padded_size is not None
+                        tree_kwargs = build_tree_attn_kwargs(
+                            ctx.trie_node, padded_size, self.device
+                        )
+                        inputs.update(tree_kwargs)
+                        tree_attn_keys = list(tree_kwargs.keys())
+                        del tree_kwargs
 
-            # Release tree attention metadata after forward pass
-            for key in tree_attn_keys:
-                del inputs[key]
+                    with (
+                        diagnostics.scope("forward"),
+                        trace_scope("fsdp_engine.forward"),
+                    ):
+                        logits = self._forward_microbatch(inputs)
 
-            ctx_dict = ctx.to_dict()
-            if is_padding_slot:
-                # Participate in the same FSDP forward/backward collectives as
-                # longer DP shards without adding a sample, loss weight, metric,
-                # or result. FP32 reduction avoids low-precision sum overflow.
-                loss = None if forward_only else self._zero_microbatch_loss(logits)
-            else:
-                loss = process_output_fn(logits, ctx_dict)
+                    for key in tree_attn_keys:
+                        del inputs[key]
 
-            if not forward_only and loss is not None:
-                with trace_scope("fsdp_engine.backward"):
-                    loss.backward()
+                    ctx_dict = ctx.to_dict()
+                    with diagnostics.scope("loss"):
+                        if is_padding_slot:
+                            # Same collectives, no sample/metric/normalization weight.
+                            loss = (
+                                None
+                                if forward_only
+                                else self._zero_microbatch_loss(logits)
+                            )
+                        else:
+                            loss = process_output_fn(logits, ctx_dict)
 
-            # Assignment evaluates the next model forward before replacing the
-            # previous outputs. Drop both the output and its logits view here so
-            # two full sequence-by-vocabulary tensors cannot overlap. Backward
-            # has already consumed the graph; callbacks retain their own results.
-            del loss, logits, ctx_dict, ctx, inputs
+                    if not forward_only and loss is not None:
+                        with (
+                            diagnostics.scope("backward"),
+                            trace_scope("fsdp_engine.backward"),
+                        ):
+                            loss.backward()
+
+                    # Release the output and graph before the next forward.
+                    del loss, logits, ctx_dict, ctx, inputs
 
     def _forward_microbatch(self, inputs):
         """Protected hook for engines returning compact token statistics."""
@@ -915,9 +943,17 @@ class FSDPEngine(TrainEngine):
         counts = [len(items)]
         if dist.is_initialized():
             counts = [None] * dist.get_world_size(self.cpu_group)
-            dist.all_gather_object(counts, len(items), group=self.cpu_group)
+            with diagnostics.scope("microbatch_counts_all_gather"):
+                dist.all_gather_object(counts, len(items), group=self.cpu_group)
         if not all(counts):
             raise ValueError("FSDP requires a nonempty microbatch list on every rank")
+        diagnostics.event(
+            "microbatch_plan",
+            counts=counts,
+            real_microbatches=len(items),
+            total_slots=max(counts),
+            padding_slots=max(counts) - len(items),
+        )
         yield from ((item, False) for item in items)
         padding_slots = max(counts) - len(items)
         if padding_slots:
@@ -944,12 +980,14 @@ class FSDPEngine(TrainEngine):
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        with diagnostics.scope("prepare_training_batch"):
+            mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
         # Step 2: Compute total loss weight
-        total_loss_weight = compute_total_loss_weight(
-            mb_list, loss_weight_fn, self.dp_group
-        )
+        with diagnostics.scope("loss_weight_collective"):
+            total_loss_weight = compute_total_loss_weight(
+                mb_list, loss_weight_fn, self.dp_group
+            )
 
         # Step 3: Forward-backward using process_output_fn callback
         def process_output(
@@ -1989,7 +2027,6 @@ class FSDPEngine(TrainEngine):
         import re
 
         from safetensors.torch import save_file
-        from torch.distributed.tensor import DTensor
 
         if dist.get_rank() == 0:
             os.makedirs(path, exist_ok=True)
@@ -1999,10 +2036,9 @@ class FSDPEngine(TrainEngine):
             if not param.requires_grad or "lora_" not in name:
                 continue
 
-            if isinstance(param.data, DTensor):
-                full_param = param.data.full_tensor()
-            else:
-                full_param = param.data
+            # CPU-offloaded shards retain a CUDA mesh. Move them through the
+            # shared gather helper before NCCL, just as rollout weight sync does.
+            full_param = self._get_full_tensor(param)
 
             if dist.get_rank() == 0:
                 # Emit PEFT-serving-standard keys. Drop the active-adapter

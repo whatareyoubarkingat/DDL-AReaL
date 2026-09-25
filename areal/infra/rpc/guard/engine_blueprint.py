@@ -19,12 +19,16 @@ which is required for NCCL compatibility.
 from __future__ import annotations
 
 import os
+import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import Future
+from contextlib import ExitStack
+from contextvars import copy_context
 from queue import Queue
 from threading import Lock, Thread
 from typing import Annotated, Any
+from uuid import uuid4
 
 from flask import Blueprint, jsonify, request
 from pydantic import BaseModel, StringConstraints, ValidationError
@@ -34,6 +38,7 @@ from areal.infra.platforms import current_platform
 from areal.infra.rpc.guard.app import GuardState, get_state
 from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
+from areal.utils import execution_diagnostics as diagnostics
 from areal.utils import logging, perf_tracer, seeding
 from areal.utils.data import broadcast_tensor_container, tensor_container_to
 from areal.utils.dynamic_import import import_from_string
@@ -177,8 +182,30 @@ def _submit_to_engine_thread(
     _init_engine_thread()
 
     future: Future = Future()
-    _engine_work_queue.put((func, args, kwargs, future, func_name))
-    return future.result()  # Block until result is available
+    submitted_func = func
+    if diagnostics.enabled():
+        execution_context = copy_context()
+        queued_at = time.monotonic()
+        diagnostics.event("rpc_queued", operation=func_name)
+
+        def run_with_diagnostics(*worker_args, **worker_kwargs):
+            diagnostics.event(
+                "rpc_running",
+                operation=func_name,
+                queued_elapsed_s=time.monotonic() - queued_at,
+            )
+            with diagnostics.scope("rpc.engine_running", operation=func_name):
+                return func(*worker_args, **worker_kwargs)
+
+        def run_in_context(*worker_args, **worker_kwargs):
+            return execution_context.run(
+                run_with_diagnostics, *worker_args, **worker_kwargs
+            )
+
+        submitted_func = run_in_context
+    _engine_work_queue.put((submitted_func, args, kwargs, future, func_name))
+    with diagnostics.scope("rpc.wait_result", operation=func_name):
+        return future.result()  # Block until result is available
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +467,7 @@ def call_engine_method():
     """
     global _engines
 
+    instrumentation = ExitStack()
     try:
         raw_data = request.get_json(silent=True) or {}
 
@@ -454,6 +482,25 @@ def call_engine_method():
         raw_args = payload.args
         raw_kwargs = payload.kwargs
         rpc_meta = payload.rpc_meta
+
+        if diagnostics.enabled():
+            supplied = (rpc_meta or {}).get("execution_diagnostics", {})
+            supplied = supplied if isinstance(supplied, dict) else {}
+            tags = {
+                key: supplied[key]
+                for key in ("request_id", "dispatch_id", "worker_id", "attempt")
+                if key in supplied
+            }
+            tags.setdefault("request_id", uuid4().hex)
+            tags.update(engine_name=engine_name, method=method_name)
+            instrumentation.enter_context(diagnostics.context(**tags))
+            instrumentation.enter_context(diagnostics.scope("rpc.request"))
+            timeout_s = supplied.get("http_timeout_s")
+            deadline = supplied.get("http_deadline_unix_s")
+            if type(deadline) in (int, float):
+                timeout_s = max(0.001, deadline - time.time())
+            instrumentation.enter_context(diagnostics.watchdog(timeout_s=timeout_s))
+            diagnostics.event("rpc_received")
 
         if engine_name not in _engines:
             return (
@@ -470,11 +517,12 @@ def call_engine_method():
         engine = _engines[engine_name]
 
         # Deserialize data
-        raw_args = deserialize_value(raw_args)
-        raw_kwargs = deserialize_value(raw_kwargs)
-        # Fetch remote tensors
-        args = RTensor.localize(raw_args)
-        kwargs = RTensor.localize(raw_kwargs)
+        with diagnostics.scope("rpc.localize"):
+            raw_args = deserialize_value(raw_args)
+            raw_kwargs = deserialize_value(raw_kwargs)
+            # Fetch remote tensors
+            args = RTensor.localize(raw_args)
+            kwargs = RTensor.localize(raw_kwargs)
 
         def execute_in_engine_thread():
             try:
@@ -484,23 +532,26 @@ def call_engine_method():
                     engine=engine, rpc_meta=rpc_meta
                 )
                 if should_broadcast:
-                    logger.debug(f"Broadcasting RPC payload for method: {method_name}")
-                    bcast_group, bcast_device = resolve_broadcast_target(
-                        engine, current_platform.current_device()
-                    )
-                    args_bcast = tensor_container_to(args, bcast_device)
-                    args_bcast = broadcast_tensor_container(
-                        args_bcast,
-                        src_rank=engine.current_data_parallel_head(),
-                        group=bcast_group,
-                    )
-                    kwargs_bcast = tensor_container_to(kwargs, bcast_device)
-                    kwargs_bcast = broadcast_tensor_container(
-                        kwargs_bcast,
-                        src_rank=engine.current_data_parallel_head(),
-                        group=bcast_group,
-                    )
-                    logger.debug("Broadcasting RPC payload done.")
+                    with diagnostics.scope("rpc.payload_broadcast"):
+                        logger.debug(
+                            f"Broadcasting RPC payload for method: {method_name}"
+                        )
+                        bcast_group, bcast_device = resolve_broadcast_target(
+                            engine, current_platform.current_device()
+                        )
+                        args_bcast = tensor_container_to(args, bcast_device)
+                        args_bcast = broadcast_tensor_container(
+                            args_bcast,
+                            src_rank=engine.current_data_parallel_head(),
+                            group=bcast_group,
+                        )
+                        kwargs_bcast = tensor_container_to(kwargs, bcast_device)
+                        kwargs_bcast = broadcast_tensor_container(
+                            kwargs_bcast,
+                            src_rank=engine.current_data_parallel_head(),
+                            group=bcast_group,
+                        )
+                        logger.debug("Broadcasting RPC payload done.")
 
                 logger.debug(f"Calling engine '{engine_name}' method: {method_name}")
 
@@ -548,12 +599,14 @@ def call_engine_method():
                     args={"method": method_name, "engine": engine_name},
                 ):
                     method = getattr(engine, method_name)
-                    result = method(*args_bcast, **kwargs_bcast)
+                    with diagnostics.scope("rpc.method"):
+                        result = method(*args_bcast, **kwargs_bcast)
 
                     # Handle update weights future
                     if isinstance(result, Future):
                         logger.debug("Waiting for update weights future")
-                        result = result.result()
+                        with diagnostics.scope("rpc.future_wait"):
+                            result = result.result()
                         logger.debug("Update weights future done")
 
                 return result
@@ -574,6 +627,7 @@ def call_engine_method():
                 f"call_{method_name}", execute_in_engine_thread
             )
         except Exception as e:
+            diagnostics.event("rpc_error", error_type=type(e).__name__)
             error_msg = str(e)
             if "Engine does not have method" in error_msg:
                 return (
@@ -604,16 +658,21 @@ def call_engine_method():
         # calls behave identically to before this gate.
         is_train = isinstance(engine, TrainEngine)
         is_init = is_train and engine.initialized
-        if not is_train or not is_init or engine.is_data_parallel_head():
-            state = get_state()
-            result = RTensor.remotize(result, node_addr=state.node_addr)
-            serialized_result = serialize_value(result)
-        else:
-            # Non-DP-head: result is discarded by controller. Skip remotize
-            # (no _storage growth) and return a sentinel.
-            serialized_result = serialize_value(None)
+        with diagnostics.scope("rpc.serialize"):
+            if not is_train or not is_init or engine.is_data_parallel_head():
+                state = get_state()
+                result = RTensor.remotize(result, node_addr=state.node_addr)
+                serialized_result = serialize_value(result)
+            else:
+                # Non-DP-head: result is discarded by controller. Skip remotize
+                # (no _storage growth) and return a sentinel.
+                serialized_result = serialize_value(None)
+        diagnostics.event("rpc_done")
         return jsonify({"status": "success", "result": serialized_result})
 
     except Exception as e:
+        diagnostics.event("rpc_error", error_type=type(e).__name__)
         logger.error(f"Unexpected error in call: {e}\n{traceback.format_exc()}")
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+    finally:
+        instrumentation.close()
